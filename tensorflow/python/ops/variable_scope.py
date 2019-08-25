@@ -28,10 +28,11 @@ import traceback
 
 import six
 from six import iteritems
-from six.moves import xrange  # pylint: disable=redefined-builtin
+from six.moves import xrange, zip  # pylint: disable=redefined-builtin
 
 from tensorflow.python import tf2
 from tensorflow.python.eager import context
+from tensorflow.python.eager import monitoring
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
@@ -51,6 +52,10 @@ __all__ = [
     "get_local_variable", "variable_scope", "variable_op_scope",
     "no_regularizer", "VariableSynchronization", "VariableAggregation"
 ]
+
+_api_usage_gauge = monitoring.BoolGauge(
+    "/tensorflow/api/resource_variables",
+    "Whether variable_scope.enable_resource_variables() is called.")
 
 
 class _PartitionInfo(object):
@@ -88,9 +93,7 @@ class _PartitionInfo(object):
           "full_shape is of length {}.".format(
               len(var_offset), len(full_shape)))
 
-    for i in xrange(len(full_shape)):
-      offset = var_offset[i]
-      shape = full_shape[i]
+    for offset, shape in zip(var_offset, full_shape):
       if offset < 0 or offset >= shape:
         raise ValueError(
             "Expected 0 <= offset < shape but found offset={}, shape={} for "
@@ -226,6 +229,7 @@ def enable_resource_variables():
   """
   global _DEFAULT_USE_RESOURCE
   _DEFAULT_USE_RESOURCE = True
+  _api_usage_gauge.get_cell().set(True)
 
 
 @tf_export(v1=["resource_variables_enabled"])
@@ -259,6 +263,7 @@ def disable_resource_variables():
   """
   global _DEFAULT_USE_RESOURCE
   _DEFAULT_USE_RESOURCE = False
+  _api_usage_gauge.get_cell().set(False)
 
 
 class _VariableStore(object):
@@ -330,7 +335,8 @@ class _VariableStore(object):
         forced to be False.
       trainable: If `True` also add the variable to the graph collection
         `GraphKeys.TRAINABLE_VARIABLES` (see `tf.Variable`). `trainable`
-        defaults to `True` unless `synchronization` is set to `ON_READ`.
+        defaults to `True`, unless `synchronization` is set to `ON_READ`, in
+        which case it defaults to `False`.
       collections: List of graph collections keys to add the `Variable` to.
         Defaults to `[GraphKeys.GLOBAL_VARIABLES]` (see `tf.Variable`).
       caching_device: Optional device string or function describing where the
@@ -370,8 +376,7 @@ class _VariableStore(object):
         aggregated. Accepted values are constants defined in the class
         `tf.VariableSynchronization`. By default the synchronization is set to
         `AUTO` and the current `DistributionStrategy` chooses when to
-        synchronize. If `synchronization` is set to `ON_READ`, `trainable` must
-        not be set to `True`.
+        synchronize.
       aggregation: Indicates how a distributed variable will be aggregated.
         Accepted values are constants defined in the class
         `tf.VariableAggregation`.
@@ -646,8 +651,7 @@ class _VariableStore(object):
         aggregated. Accepted values are constants defined in the class
         `tf.VariableSynchronization`. By default the synchronization is set to
         `AUTO` and the current `DistributionStrategy` chooses when to
-        synchronize. If `synchronization` is set to `ON_READ`, `trainable` must
-        not be set to `True`.
+        synchronize.
       aggregation: Indicates how a distributed variable will be aggregated.
         Accepted values are constants defined in the class
         `tf.VariableAggregation`.
@@ -895,10 +899,14 @@ class _VariableStore(object):
         if tf_inspect.isclass(initializer):
           initializer = initializer()
         if shape is not None and shape.is_fully_defined():
-          init_val = lambda: initializer(  # pylint: disable=g-long-lambda
-              shape.as_list(),
-              dtype=dtype,
-              partition_info=partition_info)
+          if "partition_info" in tf_inspect.getargspec(initializer).args:
+            init_val = lambda: initializer(  # pylint: disable=g-long-lambda
+                shape.as_list(),
+                dtype=dtype,
+                partition_info=partition_info)
+          else:
+            init_val = lambda: initializer(  # pylint: disable=g-long-lambda
+                shape.as_list(), dtype=dtype)
           variable_dtype = dtype.base_dtype
         elif len(tf_inspect.getargspec(initializer).args) == len(
             tf_inspect.getargspec(initializer).defaults or []):
@@ -1581,8 +1589,7 @@ Args:
     aggregated. Accepted values are constants defined in the class
     `tf.VariableSynchronization`. By default the synchronization is set to
     `AUTO` and the current `DistributionStrategy` chooses
-    when to synchronize. If `synchronization` is set to `ON_READ`,
-    `trainable` must not be set to `True`.
+    when to synchronize.
   aggregation: Indicates how a distributed variable will be aggregated.
     Accepted values are constants defined in the class
     `tf.VariableAggregation`.
@@ -1726,8 +1733,6 @@ def _get_partitioned_variable(name,
       Accepted values are constants defined in the class
       `tf.VariableSynchronization`. By default the synchronization is set to
       `AUTO` and the current `DistributionStrategy` chooses when to synchronize.
-      If `synchronization` is set to `ON_READ`, `trainable` must not be set to
-      `True`.
     aggregation: Indicates how a distributed variable will be aggregated.
       Accepted values are constants defined in the class
       `tf.VariableAggregation`.
@@ -2220,10 +2225,11 @@ class variable_scope(object):
 
     try:
       return self._enter_scope_uncached()
-    finally:
+    except:
       if (self._in_graph_mode and not self._building_function and
           self._graph_context_manager is not None):
         self._graph_context_manager.__exit__(*sys.exc_info())
+      raise
 
   def _enter_scope_uncached(self):
     """Enters the context manager when there is no cached scope yet.
@@ -2345,12 +2351,18 @@ class variable_scope(object):
       return entered_pure_variable_scope
 
   def __exit__(self, type_arg, value_arg, traceback_arg):
-    self._cached_pure_variable_scope.__exit__(type_arg, value_arg,
-                                              traceback_arg)
-    if self._current_name_scope:
-      self._current_name_scope.__exit__(type_arg, value_arg, traceback_arg)
-    if self._in_graph_mode and not self._building_function:
-      self._graph_context_manager.__exit__(type_arg, value_arg, traceback_arg)
+    try:
+      self._cached_pure_variable_scope.__exit__(type_arg, value_arg,
+                                                traceback_arg)
+    finally:
+      try:
+        if self._current_name_scope:
+          self._current_name_scope.__exit__(type_arg, value_arg,
+                                            traceback_arg)
+      finally:
+        if self._in_graph_mode and not self._building_function:
+          self._graph_context_manager.__exit__(type_arg, value_arg,
+                                               traceback_arg)
 
 
 # pylint: disable=g-doc-return-or-yield
@@ -2469,6 +2481,7 @@ def default_variable_creator(next_creator=None, **kwargs):
   use_resource = kwargs.get("use_resource", None)
   synchronization = kwargs.get("synchronization", None)
   aggregation = kwargs.get("aggregation", None)
+  shape = kwargs.get("shape", None)
 
   if use_resource is None:
     use_resource = get_variable_scope().use_resource
@@ -2490,7 +2503,8 @@ def default_variable_creator(next_creator=None, **kwargs):
         import_scope=import_scope,
         distribute_strategy=distribute_strategy,
         synchronization=synchronization,
-        aggregation=aggregation)
+        aggregation=aggregation,
+        shape=shape)
   else:
     return variables.RefVariable(
         initial_value=initial_value,
@@ -2505,7 +2519,8 @@ def default_variable_creator(next_creator=None, **kwargs):
         expected_shape=expected_shape,
         import_scope=import_scope,
         synchronization=synchronization,
-        aggregation=aggregation)
+        aggregation=aggregation,
+        shape=shape)
 
 
 def default_variable_creator_v2(next_creator=None, **kwargs):
@@ -2523,6 +2538,7 @@ def default_variable_creator_v2(next_creator=None, **kwargs):
   distribute_strategy = kwargs.get("distribute_strategy", None)
   synchronization = kwargs.get("synchronization", None)
   aggregation = kwargs.get("aggregation", None)
+  shape = kwargs.get("shape", None)
 
   return resource_variable_ops.ResourceVariable(
       initial_value=initial_value,
@@ -2536,7 +2552,8 @@ def default_variable_creator_v2(next_creator=None, **kwargs):
       import_scope=import_scope,
       distribute_strategy=distribute_strategy,
       synchronization=synchronization,
-      aggregation=aggregation)
+      aggregation=aggregation,
+      shape=shape)
 
 
 variables.default_variable_creator = default_variable_creator
@@ -2575,42 +2592,42 @@ def variable_creator_scope_v1(variable_creator):
   custom creators when they do create variables.
 
   The valid keyword arguments in kwds are:
-      initial_value: A `Tensor`, or Python object convertible to a `Tensor`,
+
+   * initial_value: A `Tensor`, or Python object convertible to a `Tensor`,
         which is the initial value for the Variable. The initial value must have
         a shape specified unless `validate_shape` is set to False. Can also be a
         callable with no argument that returns the initial value when called. In
         that case, `dtype` must be specified. (Note that initializer functions
         from init_ops.py must first be bound to a shape before being used here.)
-      trainable: If `True`, the default, also adds the variable to the graph
+   * trainable: If `True`, the default, also adds the variable to the graph
         collection `GraphKeys.TRAINABLE_VARIABLES`. This collection is used as
         the default list of variables to use by the `Optimizer` classes.
-        `trainable` defaults to `True` unless `synchronization` is
-        set to `ON_READ`.
-      collections: List of graph collections keys. The new variable is added to
+        `trainable` defaults to `True`, unless `synchronization` is
+        set to `ON_READ`, in which case it defaults to `False`.
+   * collections: List of graph collections keys. The new variable is added to
         these collections. Defaults to `[GraphKeys.GLOBAL_VARIABLES]`.
-      validate_shape: If `False`, allows the variable to be initialized with a
+   * validate_shape: If `False`, allows the variable to be initialized with a
         value of unknown shape. If `True`, the default, the shape of
         `initial_value` must be known.
-      caching_device: Optional device string describing where the Variable
+   * caching_device: Optional device string describing where the Variable
         should be cached for reading.  Defaults to the Variable's device.
         If not `None`, caches on another device.  Typical use is to cache
         on the device where the Ops using the Variable reside, to deduplicate
         copying through `Switch` and other conditional statements.
-      name: Optional name for the variable. Defaults to `'Variable'` and gets
+   * name: Optional name for the variable. Defaults to `'Variable'` and gets
         uniquified automatically.
-      dtype: If set, initial_value will be converted to the given type.
+   * dtype: If set, initial_value will be converted to the given type.
         If `None`, either the datatype will be kept (if `initial_value` is
         a Tensor), or `convert_to_tensor` will decide.
-      constraint: A constraint function to be applied to the variable after
+   * constraint: A constraint function to be applied to the variable after
         updates by some algorithms.
-      use_resource: if True, a ResourceVariable is always created.
-      synchronization: Indicates when a distributed a variable will be
+   * use_resource: if True, a ResourceVariable is always created.
+   * synchronization: Indicates when a distributed a variable will be
         aggregated. Accepted values are constants defined in the class
         `tf.VariableSynchronization`. By default the synchronization is set to
         `AUTO` and the current `DistributionStrategy` chooses
-        when to synchronize. If `synchronization` is set to `ON_READ`,
-        `trainable` must not be set to `True`.
-      aggregation: Indicates how a distributed variable will be aggregated.
+        when to synchronize.
+   * aggregation: Indicates how a distributed variable will be aggregated.
         Accepted values are constants defined in the class
         `tf.VariableAggregation`.
 
@@ -2651,36 +2668,36 @@ def variable_creator_scope(variable_creator):
   custom creators when they do create variables.
 
   The valid keyword arguments in kwds are:
-      initial_value: A `Tensor`, or Python object convertible to a `Tensor`,
+
+   * initial_value: A `Tensor`, or Python object convertible to a `Tensor`,
         which is the initial value for the Variable. The initial value must have
         a shape specified unless `validate_shape` is set to False. Can also be a
         callable with no argument that returns the initial value when called. In
         that case, `dtype` must be specified. (Note that initializer functions
         from init_ops.py must first be bound to a shape before being used here.)
-      trainable: If `True`, the default, GradientTapes automatically watch
+   * trainable: If `True`, the default, GradientTapes automatically watch
         uses of this Variable.
-      validate_shape: If `False`, allows the variable to be initialized with a
+   * validate_shape: If `False`, allows the variable to be initialized with a
         value of unknown shape. If `True`, the default, the shape of
         `initial_value` must be known.
-      caching_device: Optional device string describing where the Variable
+   * caching_device: Optional device string describing where the Variable
         should be cached for reading.  Defaults to the Variable's device.
         If not `None`, caches on another device.  Typical use is to cache
         on the device where the Ops using the Variable reside, to deduplicate
         copying through `Switch` and other conditional statements.
-      name: Optional name for the variable. Defaults to `'Variable'` and gets
+   * name: Optional name for the variable. Defaults to `'Variable'` and gets
         uniquified automatically.
       dtype: If set, initial_value will be converted to the given type.
         If `None`, either the datatype will be kept (if `initial_value` is
         a Tensor), or `convert_to_tensor` will decide.
-      constraint: A constraint function to be applied to the variable after
+   * constraint: A constraint function to be applied to the variable after
         updates by some algorithms.
-      synchronization: Indicates when a distributed a variable will be
+   * synchronization: Indicates when a distributed a variable will be
         aggregated. Accepted values are constants defined in the class
         `tf.VariableSynchronization`. By default the synchronization is set to
         `AUTO` and the current `DistributionStrategy` chooses
-        when to synchronize. If `synchronization` is set to `ON_READ`,
-        `trainable` must not be set to `True`.
-      aggregation: Indicates how a distributed variable will be aggregated.
+        when to synchronize.
+   * aggregation: Indicates how a distributed variable will be aggregated.
         Accepted values are constants defined in the class
         `tf.VariableAggregation`.
 

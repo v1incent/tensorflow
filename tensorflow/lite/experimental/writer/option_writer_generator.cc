@@ -40,6 +40,7 @@ static const char* param_structs[] = {"TfLiteAddParams",
                                       "TfLiteFakeQuantParams",
                                       "TfLiteFullyConnectedParams",
                                       "TfLiteGatherParams",
+                                      "TfLiteIfParams",
                                       "TfLiteL2NormParams",
                                       "TfLiteLeakyReluParams",
                                       "TfLiteLocalResponseNormParams",
@@ -63,6 +64,7 @@ static const char* param_structs[] = {"TfLiteAddParams",
                                       "TfLiteSoftmaxParams",
                                       "TfLiteSpaceToBatchNDParams",
                                       "TfLiteSpaceToDepthParams",
+                                      "TfLiteDepthToSpaceParams",
                                       "TfLiteSparseToDenseParams",
                                       "TfLiteSplitParams",
                                       "TfLiteSplitVParams",
@@ -76,6 +78,7 @@ static const char* param_structs[] = {"TfLiteAddParams",
                                       "TfLiteUniqueParams",
                                       "TfLiteUnpackParams",
                                       "TfLiteReverseSequenceParams",
+                                      "TfLiteWhileParams",
                                       nullptr};
 }  // namespace
 
@@ -174,6 +177,7 @@ class OpOptionData {
     op_to_option_["RELU"] = "";
     op_to_option_["RELU_N1_TO_1"] = "";
     op_to_option_["RELU6"] = "";
+    op_to_option_["ROUND"] = "";
     op_to_option_["TANH"] = "";
     op_to_option_["PRELU"] = "";
     op_to_option_["SIN"] = "";

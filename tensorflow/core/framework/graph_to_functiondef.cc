@@ -36,6 +36,7 @@ namespace {
 // a name collision with the other node names, so if necessary we add
 // a suffix to make names unique.  So if we have an input named "A" and a
 // node in the function body named "a", they will be renamed to "a" and "a_0".
+// TODO(b/139886381) Unify this and the one in c_api_function.cc
 class NodeNameMapping {
  public:
   NodeNameMapping() = default;
@@ -54,7 +55,13 @@ class NodeNameMapping {
   string NormalizeHelper(string name) const;
   string UniquifyHelper(string name);
 
-  std::unordered_set<string> used_names_;
+  // The normalized/uniquified names already used as
+  // input names (in signature), output names (in signature), and node names
+  // (in node_def).
+  // This is a superset of values in name_mapping_.
+  std::unordered_map<string, uint64> used_names_;
+  // Mapping from original node name from the graph to the normalized
+  // and uniquified version of it.
   std::unordered_map<string, string> name_mapping_;
 };
 
@@ -76,12 +83,15 @@ string NodeNameMapping::NormalizeHelper(string name) const {
 }
 
 string NodeNameMapping::UniquifyHelper(string name) {
+  auto it = used_names_.emplace(name, 0);
   // If the name hasn't been used yet, use it as-is.
-  if (used_names_.insert(name).second) return name;
+  if (it.second) return name;
+
   // Add a suffix to name to make it unique.
-  for (int i = 0;; ++i) {
-    const string candidate = strings::StrCat(name, "_", i);
-    if (used_names_.insert(candidate).second) return candidate;
+  while (true) {
+    const string candidate = strings::StrCat(name, "_", it.first->second);
+    it.first->second++;
+    if (used_names_.emplace(candidate, 0).second) return candidate;
   }
 }
 
@@ -208,10 +218,18 @@ Status GraphToFunctionDef(const Graph& graph, const string& name,
       node_def->add_input(
           strings::StrCat(edge->src()->name(), ":", edge->src_output()));
     }
-
     // Add control inputs
+    std::vector<std::string> control_inputs;
+    control_inputs.reserve(control_edges.size());
     for (const Edge* edge : control_edges) {
-      node_def->add_input(strings::StrCat("^", edge->src()->name()));
+      control_inputs.push_back(strings::StrCat("^", edge->src()->name()));
+    }
+    // Sort the control inputs so that nodes that are semantically equivalent
+    // generate idential node_def.
+    std::sort(control_inputs.begin(), control_inputs.end());
+
+    for (const auto& input : control_inputs) {
+      node_def->add_input(input);
     }
 
     // Populate tensor_renaming.
@@ -241,7 +259,7 @@ Status GraphToFunctionDef(const Graph& graph, const string& name,
   for (int n_index = 0; n_index < fdef->node_def_size(); ++n_index) {
     NodeDef* node_def = fdef->mutable_node_def(n_index);
     for (int i = 0; i < node_def->input_size(); ++i) {
-      if (str_util::StartsWith(node_def->input(i), "^")) {
+      if (absl::StartsWith(node_def->input(i), "^")) {
         // Control input
         const string normalized =
             node_names.Renormalize(node_def->input(i).substr(1));

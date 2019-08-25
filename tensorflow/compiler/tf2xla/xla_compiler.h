@@ -286,7 +286,8 @@ class XlaCompiler {
     std::shared_ptr<xla::XlaComputation> computation;
   };
 
-  typedef std::function<xla::StatusOr<xla::Shape>(const TensorShape&, DataType)>
+  typedef std::function<xla::StatusOr<xla::Shape>(const TensorShape&, DataType,
+                                                  bool)>
       ShapeRepresentationFn;
   struct Options {
     // Name of the compilation device to use. It must be set by the caller.
@@ -339,7 +340,7 @@ class XlaCompiler {
     // here, but on some devices (notably, GPUs), TensorFlow tends to eagerly
     // allocate most or all available memory on the device, leaving none for the
     // compiler to access, unless it can use TensorFlow's allocator.
-    xla::DeviceMemoryAllocator* device_allocator = nullptr;
+    se::DeviceMemoryAllocator* device_allocator = nullptr;
   };
 
   explicit XlaCompiler(Options options);
@@ -446,7 +447,7 @@ class XlaCompiler {
                         const std::vector<XlaCompiler::Argument>& args,
                         bool use_tuple_arg, xla::XlaBuilder* builder,
                         XlaContext* context,
-                        const std::map<int, int>& arg_cores,
+                        const std::map<int, xla::OpSharding>& arg_shardings,
                         std::vector<XlaExpression>* arg_expressions,
                         std::vector<int>* input_to_args,
                         std::vector<xla::Shape>* input_shapes,

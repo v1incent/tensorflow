@@ -15,16 +15,18 @@ limitations under the License.
 #include "tensorflow/python/framework/python_op_gen.h"
 
 #include <stdio.h>
+
 #include <sstream>
 #include <unordered_map>
+
+#include "absl/strings/escaping.h"
 #include "tensorflow/core/framework/api_def.pb.h"
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/op.h"
-#include "tensorflow/core/framework/op_def.pb_text.h"
 #include "tensorflow/core/framework/op_def.pb.h"
 #include "tensorflow/core/framework/op_def_util.h"
 #include "tensorflow/core/framework/op_gen_lib.h"
-#include "tensorflow/core/framework/tensor.pb_text.h"
+#include "tensorflow/core/framework/tensor.pb.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/lib/gtl/map_util.h"
@@ -99,7 +101,7 @@ void Unflatten(const string& prefix, const std::vector<string>& output_sizes,
 string TensorPBString(const TensorProto& pb) {
   // Note: This gets used in the argument list, and so must survive naive
   // word wrapping.
-  return strings::StrCat("\"\"\"", ProtoShortDebugString(pb), "\"\"\"");
+  return strings::StrCat("\"\"\"", pb.ShortDebugString(), "\"\"\"");
 }
 
 class GenEagerPythonOp : public python_op_gen_internal::GenPythonOp {
@@ -108,7 +110,7 @@ class GenEagerPythonOp : public python_op_gen_internal::GenPythonOp {
                    const string& function_name)
       : python_op_gen_internal::GenPythonOp(op_def, api_def, function_name) {
     op_name_ = function_name_;
-    str_util::ConsumePrefix(&op_name_, "_");
+    absl::ConsumePrefix(&op_name_, "_");
   }
   ~GenEagerPythonOp() override {}
 
@@ -388,8 +390,13 @@ void GenEagerPythonOp::HandleGraphMode(const string& function_setup) {
       for (int i = 0; i < op_def_.attr_size(); ++i) {
         if (i > 0) strings::StrAppend(&attr_values, ", ");
         const auto& attr_name(op_def_.attr(i).name());
-        strings::StrAppend(&attr_values, "\"", attr_name, "\", _op.get_attr(\"",
-                           attr_name, "\")");
+        if (op_def_.attr(i).type() == "type") {
+          strings::StrAppend(&attr_values, "\"", attr_name,
+                             "\", _op._get_attr_type(\"", attr_name, "\")");
+        } else {
+          strings::StrAppend(&attr_values, "\"", attr_name,
+                             "\", _op.get_attr(\"", attr_name, "\")");
+        }
       }
       strings::StrAppend(&attr_values, ")");
       strings::StrAppend(
@@ -487,7 +494,7 @@ bool GenEagerPythonOp::GetEagerFunctionSetup(const string& indentation,
       strings::StrAppend(function_setup, indentation, "  ", attr_api_name,
                          " = ", default_value, "\n");
     }
-    if (str_util::StartsWith(attr_type, "list(")) {
+    if (absl::StartsWith(attr_type, "list(")) {
       ExpectListArg(indentation, attr_api_name, function_setup);
     }
 
@@ -719,7 +726,7 @@ bool GenEagerPythonOp::AddEagerFallbackCode(
 void GenEagerPythonOp::AddEagerFastPathExecute() {
   string fastpath_execute_params = strings::StrCat(
       "_ctx._context_handle, _ctx._thread_local_data.device_name, \"",
-      op_def_.name(), "\", ", "name, _ctx._post_execution_callbacks");
+      op_def_.name(), "\", ", "name, _ctx.post_execution_callbacks");
   string fallback_params;
 
   for (int i = 0; i < api_def_.in_arg_size(); i++) {
@@ -1070,12 +1077,12 @@ from tensorflow.tools.docs import doc_controls as _doc_controls
 )");
 
   result.append("# ");
-  auto ops_text = ProtoDebugString(cleaned_ops);
-  str_util::StripTrailingWhitespace(&ops_text);
+  auto ops_text = cleaned_ops.DebugString();
+  absl::StripTrailingAsciiWhitespace(&ops_text);
   result.append(str_util::StringReplace(ops_text, "\n", "\n# ", true));
   result.append("\n");
   strings::Appendf(&result, "_op_def_lib = _InitOpDefLibrary(b\"%s\")\n",
-                   str_util::CEscape(cleaned_ops.SerializeAsString()).c_str());
+                   absl::CEscape(cleaned_ops.SerializeAsString()).c_str());
   return result;
 }
 

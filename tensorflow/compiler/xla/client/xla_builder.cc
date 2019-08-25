@@ -35,6 +35,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
 #include "tensorflow/compiler/xla/service/hlo_opcode.h"
 #include "tensorflow/compiler/xla/service/shape_inference.h"
+#include "tensorflow/compiler/xla/status_macros.h"
 #include "tensorflow/compiler/xla/util.h"
 
 namespace xla {
@@ -701,6 +702,12 @@ XlaOp XlaBuilder::BroadcastInDim(
     // not necessarily the same as the dimension sizes of the output shape.
     auto output_shape =
         ShapeUtil::MakeShape(operand_shape.element_type(), out_dim_size);
+    if (operand_shape.rank() != broadcast_dimensions.size()) {
+      return InvalidArgument(
+          "Size of broadcast_dimensions has to match operand's rank; operand "
+          "rank: %lld, size of broadcast_dimensions %u.",
+          operand_shape.rank(), broadcast_dimensions.size());
+    }
     for (int i = 0; i < broadcast_dimensions.size(); i++) {
       if (broadcast_dimensions[i] < 0 ||
           broadcast_dimensions[i] > out_dim_size.size()) {
@@ -734,11 +741,15 @@ XlaOp XlaBuilder::BroadcastInDim(
   });
 }
 
-StatusOr<XlaOp> XlaBuilder::Reshape(const Shape& shape, const XlaOp& operand) {
+StatusOr<XlaOp> XlaBuilder::Reshape(const Shape& shape, XlaOp operand,
+                                    int64 inferred_dimension) {
   TF_RETURN_IF_ERROR(first_error_);
 
   HloInstructionProto instr;
   *instr.mutable_shape() = shape.ToProto();
+  if (inferred_dimension != -1) {
+    instr.add_dimensions(inferred_dimension);
+  }
   return AddInstruction(std::move(instr), HloOpcode::kReshape, {operand});
 }
 
@@ -913,7 +924,8 @@ XlaOp XlaBuilder::Pad(const XlaOp& operand, const XlaOp& padding_value,
 
 XlaOp XlaBuilder::Reshape(const XlaOp& operand,
                           absl::Span<const int64> dimensions,
-                          absl::Span<const int64> new_sizes) {
+                          absl::Span<const int64> new_sizes,
+                          int64 inferred_dimension) {
   return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
     TF_ASSIGN_OR_RETURN(const Shape& operand_shape, GetShape(operand));
     TF_ASSIGN_OR_RETURN(const Shape shape,
@@ -922,17 +934,18 @@ XlaOp XlaBuilder::Reshape(const XlaOp& operand,
     XlaOp transposed = IsIdentityPermutation(dimensions)
                            ? operand
                            : Transpose(operand, dimensions);
-    return Reshape(shape, transposed);
+    return Reshape(shape, transposed, inferred_dimension);
   });
 }
 
 XlaOp XlaBuilder::Reshape(const XlaOp& operand,
-                          absl::Span<const int64> new_sizes) {
+                          absl::Span<const int64> new_sizes,
+                          int64 inferred_dimension) {
   return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
     TF_ASSIGN_OR_RETURN(Shape shape, GetShape(operand));
     std::vector<int64> dimensions(shape.dimensions_size());
     std::iota(dimensions.begin(), dimensions.end(), 0);
-    return Reshape(operand, dimensions, new_sizes);
+    return Reshape(operand, dimensions, new_sizes, inferred_dimension);
   });
 }
 
@@ -1019,6 +1032,11 @@ XlaOp XlaBuilder::GetTupleElement(const XlaOp& tuple_data, int64 index) {
     if (!tuple_shape.IsTuple()) {
       return InvalidArgument(
           "Operand to GetTupleElement() is not a tuple; got %s",
+          ShapeUtil::HumanString(tuple_shape));
+    }
+    if (index < 0 || index >= ShapeUtil::TupleElementCount(tuple_shape)) {
+      return InvalidArgument(
+          "GetTupleElement() index (%d) out of range for tuple shape %s", index,
           ShapeUtil::HumanString(tuple_shape));
     }
     *instr.mutable_shape() =
@@ -1302,14 +1320,13 @@ XlaOp XlaBuilder::Infeed(const Shape& shape, const string& config) {
     instr.set_infeed_config(config);
 
     if (shape.IsArray() && sharding() &&
-        sharding()->type() == OpSharding::Type::OpSharding_Type_OTHER) {
+        sharding()->type() == OpSharding::OTHER) {
       // TODO(b/110793772): Support tiled array-shaped infeeds.
       return InvalidArgument(
           "Tiled sharding is not yet supported for array-shaped infeeds");
     }
 
-    if (sharding() &&
-        sharding()->type() == OpSharding::Type::OpSharding_Type_REPLICATED) {
+    if (sharding() && sharding()->type() == OpSharding::REPLICATED) {
       return InvalidArgument(
           "Replicated sharding is not yet supported for infeeds");
     }
@@ -1336,8 +1353,7 @@ XlaOp XlaBuilder::Infeed(const Shape& shape, const string& config) {
     // data and a token. For tuple sharding type, the sharding must be changed
     // to accommodate the token.
     XlaOp infeed;
-    if (sharding() &&
-        sharding()->type() == OpSharding::Type::OpSharding_Type_TUPLE) {
+    if (sharding() && sharding()->type() == OpSharding::TUPLE) {
       // TODO(b/80000000): Remove this when clients have been updated to handle
       // tokens.
       OpSharding infeed_instruction_sharding = *sharding();
@@ -1378,14 +1394,13 @@ XlaOp XlaBuilder::InfeedWithToken(const XlaOp& token, const Shape& shape,
     instr.set_infeed_config(config);
 
     if (shape.IsArray() && sharding() &&
-        sharding()->type() == OpSharding::Type::OpSharding_Type_OTHER) {
+        sharding()->type() == OpSharding::OTHER) {
       // TODO(b/110793772): Support tiled array-shaped infeeds.
       return InvalidArgument(
           "Tiled sharding is not yet supported for array-shaped infeeds");
     }
 
-    if (sharding() &&
-        sharding()->type() == OpSharding::Type::OpSharding_Type_REPLICATED) {
+    if (sharding() && sharding()->type() == OpSharding::REPLICATED) {
       return InvalidArgument(
           "Replicated sharding is not yet supported for infeeds");
     }
@@ -1516,7 +1531,7 @@ XlaOp XlaBuilder::CustomCall(
     }
     *instr.mutable_shape() = shape.ToProto();
     instr.set_custom_call_target(call_target_name);
-    instr.set_custom_call_opaque(opaque);
+    instr.set_backend_config(opaque);
     if (operand_shapes_with_layout.has_value()) {
       if (!LayoutUtil::HasLayout(shape)) {
         return InvalidArgument(
@@ -1573,122 +1588,6 @@ XlaOp XlaBuilder::Rev(const XlaOp& operand,
       instr.add_dimensions(dim);
     }
     return AddInstruction(std::move(instr), HloOpcode::kReverse, {operand});
-  });
-}
-
-namespace {
-// Switch from a floating point value to a integer value in such a way that when
-// using the integer value to compare, we get the same result for normal values,
-// and -Nan is treated as the smallest value, and Nan is treated as the largest
-// value.
-// If f is a float, and
-// x = bit_cast<int32>(f);
-// y = x < 0 ? numeric_limits<int32>::max() - x : x;
-// then y is ordered as an int32 such that finite values have the obvious order,
-// -0 is ordered before 0, and -NaN and NaN appear at the beginning and end of
-// the ordering.
-// Note that in order to avoid -x to overflow, we calculate
-// numeric_limits<int32>::max() - x as unsigned, and then convert back to
-// signed.
-XlaOp BitcastConvertFloatingPointToIntegral(const XlaOp& value,
-                                            int64 bit_width) {
-  PrimitiveType signed_type;
-  PrimitiveType unsigned_type;
-  XlaOp max_value;
-  switch (bit_width) {
-    case 16:
-      max_value =
-          ConstantR0(value.builder(),
-                     static_cast<uint16>(std::numeric_limits<int16>::max()));
-      signed_type = S16;
-      unsigned_type = U16;
-      break;
-    case 32:
-      max_value =
-          ConstantR0(value.builder(),
-                     static_cast<uint32>(std::numeric_limits<int32>::max()));
-      signed_type = S32;
-      unsigned_type = U32;
-      break;
-    case 64:
-      max_value =
-          ConstantR0(value.builder(),
-                     static_cast<uint64>(std::numeric_limits<int64>::max()));
-      signed_type = S64;
-      unsigned_type = U64;
-      break;
-    default:
-      return value.builder()->ReportError(
-          InvalidArgument("Invalid bit width %lld for Comparator floating "
-                          "point parameter.",
-                          bit_width));
-  }
-  auto signed_value = BitcastConvertType(value, signed_type);
-  auto unsigned_value = BitcastConvertType(value, unsigned_type);
-  auto flipped_value =
-      BitcastConvertType(Sub(max_value, unsigned_value), signed_type);
-  auto is_negative =
-      Lt(signed_value,
-         ConstantLiteral(value.builder(), LiteralUtil::Zero(signed_type)));
-  return Select(is_negative, flipped_value, signed_value);
-}
-}  // namespace
-
-XlaOp XlaBuilder::Sort(const XlaOp& keys, absl::Span<const XlaOp> values,
-                       int64 dimension) {
-  return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
-    std::vector<XlaOp> operands{keys};
-    for (const XlaOp& value : values) {
-      operands.push_back(value);
-    }
-    // Build the default less-than comparator (copied from lib/comparators.cc).
-    // TODO(b/122298745): Remove the deprecated API method so that this code
-    // duplication can be deleted.
-    auto b = this->CreateSubBuilder("comparator");
-    std::vector<PrimitiveType> operand_types;
-    for (const XlaOp& operand : operands) {
-      TF_ASSIGN_OR_RETURN(auto operand_shape, GetShape(operand));
-      operand_types.push_back(operand_shape.element_type());
-    }
-
-    int64 parameter_count = 0;
-    XlaOp first_lhs_param;
-    XlaOp first_rhs_param;
-
-    for (auto operand_type : operand_types) {
-      auto scalar_shape = ShapeUtil::MakeShape(operand_type, {});
-      auto lhs_param =
-          b->Parameter(parameter_count * 2, scalar_shape,
-                       absl::StrCat("p.", parameter_count, ".lhs"));
-      auto rhs_param =
-          b->Parameter(parameter_count * 2 + 1, scalar_shape,
-                       absl::StrCat("p.", parameter_count, ".rhs"));
-      if (parameter_count == 0) {
-        first_lhs_param = lhs_param;
-        first_rhs_param = rhs_param;
-      }
-      ++parameter_count;
-    }
-    if (primitive_util::IsFloatingPointType(operand_types[0])) {
-      PrimitiveType compare_type = operand_types[0];
-      // Special-case handling for BF16. We currently do not support direct
-      // comparisons with BF16, so we convert to F32 and then use the F32
-      // comparison logic.
-      if (compare_type == BF16) {
-        compare_type = F32;
-        first_lhs_param = b->ConvertElementType(first_lhs_param, F32);
-        first_rhs_param = b->ConvertElementType(first_rhs_param, F32);
-      }
-      int64 bit_width = primitive_util::BitWidth(compare_type);
-      first_lhs_param =
-          BitcastConvertFloatingPointToIntegral(first_lhs_param, bit_width);
-      first_rhs_param =
-          BitcastConvertFloatingPointToIntegral(first_rhs_param, bit_width);
-    }
-    Lt(first_lhs_param, first_rhs_param);
-
-    TF_ASSIGN_OR_RETURN(auto comparator, b->Build());
-    return Sort(operands, comparator, dimension, /*is_stable=*/false);
   });
 }
 
@@ -1851,9 +1750,11 @@ XlaOp XlaBuilder::While(const XlaComputation& condition,
 
 XlaOp XlaBuilder::Gather(const XlaOp& input, const XlaOp& start_indices,
                          const GatherDimensionNumbers& dimension_numbers,
-                         absl::Span<const int64> slice_sizes) {
+                         absl::Span<const int64> slice_sizes,
+                         bool indices_are_sorted) {
   return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
     HloInstructionProto instr;
+    instr.set_indices_are_sorted(indices_are_sorted);
 
     TF_ASSIGN_OR_RETURN(const Shape& input_shape, GetShape(input));
     TF_ASSIGN_OR_RETURN(const Shape& start_indices_shape,
@@ -1876,9 +1777,11 @@ XlaOp XlaBuilder::Gather(const XlaOp& input, const XlaOp& start_indices,
 XlaOp XlaBuilder::Scatter(const XlaOp& input, const XlaOp& scatter_indices,
                           const XlaOp& updates,
                           const XlaComputation& update_computation,
-                          const ScatterDimensionNumbers& dimension_numbers) {
+                          const ScatterDimensionNumbers& dimension_numbers,
+                          bool indices_are_sorted) {
   return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
     HloInstructionProto instr;
+    instr.set_indices_are_sorted(indices_are_sorted);
 
     TF_ASSIGN_OR_RETURN(const Shape& input_shape, GetShape(input));
     TF_ASSIGN_OR_RETURN(const Shape& scatter_indices_shape,
@@ -1904,13 +1807,39 @@ XlaOp XlaBuilder::Conditional(const XlaOp& predicate, const XlaOp& true_operand,
                               const XlaComputation& true_computation,
                               const XlaOp& false_operand,
                               const XlaComputation& false_computation) {
-  // The index of true_computation must be 0 and that of false computation
-  // must be 1.
-  return Conditional(predicate, {&true_computation, &false_computation},
-                     {true_operand, false_operand});
+  return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
+    TF_ASSIGN_OR_RETURN(xla::Shape shape, GetShape(predicate));
+
+    if (!ShapeUtil::IsScalar(shape) || shape.element_type() != PRED) {
+      return InvalidArgument(
+          "Argument to predicated-Conditional is not a scalar of PRED type "
+          "(%s).",
+          ShapeUtil::HumanString(shape));
+    }
+    // The index of true_computation must be 0 and that of false computation
+    // must be 1.
+    return ConditionalImpl(predicate, {&true_computation, &false_computation},
+                           {true_operand, false_operand});
+  });
 }
 
 XlaOp XlaBuilder::Conditional(
+    const XlaOp& branch_index,
+    absl::Span<const XlaComputation* const> branch_computations,
+    absl::Span<const XlaOp> branch_operands) {
+  return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
+    TF_ASSIGN_OR_RETURN(xla::Shape shape, GetShape(branch_index));
+
+    if (!ShapeUtil::IsScalar(shape) || shape.element_type() != S32) {
+      return InvalidArgument(
+          "Argument to indexed-Conditional is not a scalar of S32 type (%s).",
+          ShapeUtil::HumanString(shape));
+    }
+    return ConditionalImpl(branch_index, branch_computations, branch_operands);
+  });
+}
+
+XlaOp XlaBuilder::ConditionalImpl(
     const XlaOp& branch_index,
     absl::Span<const XlaComputation* const> branch_computations,
     absl::Span<const XlaOp> branch_operands) {
@@ -2008,8 +1937,6 @@ XlaOp XlaBuilder::ReduceWindow(const XlaOp& operand, const XlaOp& init_value,
                                absl::Span<const int64> window_strides,
                                Padding padding) {
   return ReportErrorOrReturn([&]() -> StatusOr<XlaOp> {
-    HloInstructionProto instr;
-
     TF_ASSIGN_OR_RETURN(const Shape& operand_shape, GetShape(operand));
     TF_RETURN_IF_ERROR(
         ValidatePaddingValues(AsInt64Slice(operand_shape.dimensions()),
@@ -2159,7 +2086,7 @@ XlaOp XlaBuilder::CrossReplicaSum(
     }
 
     if (channel_id.has_value()) {
-      instr.set_all_reduce_id(channel_id->handle());
+      instr.set_channel_id(channel_id->handle());
     }
 
     AddCalledComputation(computation, &instr);
@@ -2881,6 +2808,12 @@ XlaOp Reshape(const XlaOp operand, absl::Span<const int64> new_sizes) {
   return operand.builder()->Reshape(operand, new_sizes);
 }
 
+XlaOp ReshapeWithInferredDimension(const XlaOp& operand,
+                                   absl::Span<const int64> new_sizes,
+                                   int64 inferred_dimension) {
+  return operand.builder()->Reshape(operand, new_sizes, inferred_dimension);
+}
+
 XlaOp Collapse(const XlaOp operand, absl::Span<const int64> dimensions) {
   return operand.builder()->Collapse(operand, dimensions);
 }
@@ -3390,10 +3323,6 @@ XlaOp Rev(const XlaOp operand, absl::Span<const int64> dimensions) {
   return operand.builder()->Rev(operand, dimensions);
 }
 
-XlaOp Sort(const XlaOp keys, absl::Span<const XlaOp> values, int64 dimension) {
-  return keys.builder()->Sort(keys, values, dimension);
-}
-
 XlaOp Sort(absl::Span<const XlaOp> operands, const XlaComputation& comparator,
            int64 dimension, bool is_stable) {
   return operands[0].builder()->Sort(operands, comparator, dimension,
@@ -3447,16 +3376,18 @@ XlaOp ReducePrecision(const XlaOp operand, const int exponent_bits,
 
 XlaOp Gather(const XlaOp input, const XlaOp start_indices,
              const GatherDimensionNumbers& dimension_numbers,
-             absl::Span<const int64> slice_sizes) {
+             absl::Span<const int64> slice_sizes, bool indices_are_sorted) {
   return input.builder()->Gather(input, start_indices, dimension_numbers,
-                                 slice_sizes);
+                                 slice_sizes, indices_are_sorted);
 }
 
 XlaOp Scatter(const XlaOp input, const XlaOp scatter_indices,
               const XlaOp updates, const XlaComputation& update_computation,
-              const ScatterDimensionNumbers& dimension_numbers) {
+              const ScatterDimensionNumbers& dimension_numbers,
+              bool indices_are_sorted) {
   return input.builder()->Scatter(input, scatter_indices, updates,
-                                  update_computation, dimension_numbers);
+                                  update_computation, dimension_numbers,
+                                  indices_are_sorted);
 }
 
 void Send(const XlaOp operand, const ChannelHandle& handle) {

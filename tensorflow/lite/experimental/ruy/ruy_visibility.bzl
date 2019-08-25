@@ -1,6 +1,6 @@
-"""
-Control of ruy visibility
-"""
+"""Control of ruy visibility"""
 
 def ruy_visibility():
-    return []
+    return [
+        "//tensorflow/lite/kernels:__subpackages__",
+    ]

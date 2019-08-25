@@ -33,6 +33,7 @@ from tensorflow.python.distribute import combinations
 from tensorflow.python.distribute import multi_worker_util
 from tensorflow.python.distribute.cluster_resolver import TFConfigClusterResolver
 from tensorflow.python.framework import ops
+from tensorflow.python.keras.optimizer_v2 import gradient_descent
 from tensorflow.python.platform import test
 
 
@@ -132,18 +133,19 @@ def make_image_model(initial_weights=None):
   return model, IMAGE_INPUTS, IMAGE_TARGETS
 
 
-# TODO(b/130243026): Re-enable this test.
 def make_lstm_model(initial_weights=None):
   inputs = keras.layers.Input(shape=(10, 20))
-  rnn1_out = keras.layers.LSTM(20, return_sequences=True)(inputs)
-  rnn2_out = keras.layers.LSTM(10)(rnn1_out)
-  outputs = keras.layers.Dense(1)(rnn2_out)
+  rnn_out = keras.layers.LSTM(4)(inputs)
+  outputs = keras.layers.Dense(1)(rnn_out)
   model = keras.Model(inputs, outputs)
 
   if initial_weights:
     model.set_weights(initial_weights)
 
-  model.compile('adam', 'binary_crossentropy', metrics=['mse'])
+  model.compile(
+      gradient_descent.SGD(0.1),
+      'sparse_categorical_crossentropy',
+      metrics=['sparse_categorical_crossentropy'])
 
   return model, LSTM_INPUTS, LSTM_TARGETS
 
@@ -177,9 +179,10 @@ class ModelCorrectnessTest(
           strategy_cls=[
               collective_strategy.CollectiveAllReduceStrategy,
           ],
-          make_model=[make_image_model, make_embedding_model],
+          make_model=[make_image_model, make_lstm_model, make_embedding_model],
+          steps_per_epoch=[50, None],
           required_gpus=[0, 1]))
-  def test_correctness(self, strategy_cls, make_model):
+  def test_correctness(self, strategy_cls, make_model, steps_per_epoch):
 
     def _worker_fn(initial_weights=None, results_without_ds=None):
       # Make sure Session is cleared at each run
@@ -193,7 +196,7 @@ class ModelCorrectnessTest(
 
       # TODO(b/129363441): Remove `steps_per_epoch`.
       results['training'] = model.fit(
-          data, steps_per_epoch=50, epochs=2).history
+          data, steps_per_epoch=steps_per_epoch, epochs=2).history
       results['trained_weights'] = model.get_weights()
 
       eval_data = self.make_dataset(inputs, targets)
@@ -204,6 +207,8 @@ class ModelCorrectnessTest(
           self.assertAllClose(
               results[key],
               results_without_ds[key],
+              rtol=1e-5,
+              atol=1e-5,
               msg='Fail to assert {}'.format(key))
 
       return results

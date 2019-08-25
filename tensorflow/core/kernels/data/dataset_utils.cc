@@ -15,32 +15,58 @@ limitations under the License.
 
 #include "tensorflow/core/kernels/data/dataset_utils.h"
 
-#include "tensorflow/core/common_runtime/device.h"
-#include "tensorflow/core/common_runtime/function.h"
+#include "tensorflow/core/framework/dataset.h"
+#include "tensorflow/core/framework/function.h"
+#include "tensorflow/core/framework/op_def_util.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/graph/graph_def_builder.h"
-#include "tensorflow/core/lib/gtl/cleanup.h"
+#include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/util/work_sharder.h"
 
 namespace tensorflow {
 namespace data {
+namespace {
+
+constexpr char kDelimiter[] = "@@";
+
+}  // anonymous namespace
 
 Status AsGraphDef(OpKernelContext* ctx, const DatasetBase* dataset,
+                  SerializationContext&& serialization_ctx,
                   GraphDef* graph_def) {
+  if (serialization_ctx.check_external_state()) {
+    TF_RETURN_IF_ERROR(dataset->CheckExternalState());
+  }
   GraphDefBuilder b;
   DatasetBase::DatasetGraphDefBuilder db(&b);
   Node* output_node = nullptr;
-  SerializationContext serialization_ctx({});
   TF_RETURN_IF_ERROR(
       db.AddInputDataset(&serialization_ctx, dataset, &output_node));
-  // Insert a purely symbolic _Retval node to indicate to consumers which Tensor
-  // represents this Dataset.
+  // Insert a purely symbolic _Retval node to indicate to consumers which node
+  // represents `dataset`.
   ops::UnaryOp("_Retval", output_node,
                b.opts()
                    .WithName("dataset")
                    .WithAttr("T", DT_VARIANT)
                    .WithAttr("index", 0));
   TF_RETURN_IF_ERROR(b.ToGraphDef(graph_def));
+  return Status::OK();
+}
+
+Status ConnectCancellationManagers(CancellationManager* parent,
+                                   CancellationManager* child,
+                                   std::function<void()>* deregister_fn) {
+  if (parent) {
+    CancellationToken token = parent->get_cancellation_token();
+    if (!parent->RegisterCallback(token, [child]() { child->StartCancel(); })) {
+      return errors::Cancelled("Operation was cancelled");
+    }
+    *deregister_fn = [parent, token]() { parent->DeregisterCallback(token); };
+  } else {
+    VLOG(1) << "Parent cancellation manager is not set. Cancellation will "
+               "not be propagated to the child cancellation manager.";
+    *deregister_fn = []() {};
+  }
   return Status::OK();
 }
 
@@ -81,12 +107,6 @@ Status VerifyShapesCompatible(const std::vector<PartialTensorShape>& expected,
   return Status::OK();
 }
 
-namespace {
-
-constexpr char kDelimiter[] = "@@";
-
-}  // namespace
-
 VariantTensorDataReader::VariantTensorDataReader(
     const tensorflow::VariantTensorData* data)
     : data_(data) {
@@ -102,7 +122,7 @@ Status VariantTensorDataReader::ReadScalar(StringPiece key, int64* val) {
   return ReadScalarInternal(key, val);
 }
 
-Status VariantTensorDataReader::ReadScalar(StringPiece key, string* val) {
+Status VariantTensorDataReader::ReadScalar(StringPiece key, tstring* val) {
   return ReadScalarInternal(key, val);
 }
 
@@ -137,7 +157,7 @@ Status VariantTensorDataWriter::WriteScalar(StringPiece key, const int64 val) {
 }
 
 Status VariantTensorDataWriter::WriteScalar(StringPiece key,
-                                            const string& val) {
+                                            const tstring& val) {
   return WriteScalarInternal(key, val);
 }
 

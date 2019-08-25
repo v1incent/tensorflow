@@ -24,7 +24,10 @@ limitations under the License.
 #else
 #include <unistd.h>
 #endif
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "tensorflow/stream_executor/cuda/cuda_diagnostics.h"
 #include "tensorflow/stream_executor/cuda/cuda_driver.h"
@@ -40,10 +43,7 @@ limitations under the License.
 #include "tensorflow/stream_executor/lib/numbers.h"
 #include "tensorflow/stream_executor/lib/path.h"
 #include "tensorflow/stream_executor/lib/process_state.h"
-#include "tensorflow/stream_executor/lib/ptr_util.h"
 #include "tensorflow/stream_executor/lib/statusor.h"
-#include "tensorflow/stream_executor/lib/str_util.h"
-#include "tensorflow/stream_executor/lib/stringprintf.h"
 #include "tensorflow/stream_executor/platform.h"
 #include "tensorflow/stream_executor/platform/logging.h"
 #include "tensorflow/stream_executor/platform/port.h"
@@ -201,7 +201,7 @@ static string GetBinaryDir(bool strip_exe) {
   HMODULE hModule = GetModuleHandle(NULL);
   GetModuleFileName(hModule, exe_path, MAX_PATH);
 #else
-  CHECK_ERR(readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1));
+  PCHECK(readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1) != -1);
 #endif
 #endif
   // Make sure it's null-terminated:
@@ -210,23 +210,20 @@ static string GetBinaryDir(bool strip_exe) {
   if (strip_exe) {
     // The exe is the last component of the path, so remove one component.
     string ret = exe_path;
-    std::vector<string> components = port::Split(exe_path, '/');
+    std::vector<string> components = absl::StrSplit(exe_path, '/');
     components.pop_back();
-    return port::Join(components, "/");
+    return absl::StrJoin(components, "/");
   }
   return exe_path;
 }
 
-bool GpuExecutor::LoadModuleFromCuBin(const char* cubin, CUmodule* module) {
+port::Status GpuExecutor::LoadModuleFromCuBin(const char* cubin,
+                                              CUmodule* module) {
   uint64_t module_refcount;
   std::tie(*module, module_refcount) = gpu_binary_to_module_[cubin];
 
   if (*module == nullptr) {
-    auto load_status = GpuDriver::LoadCubin(context_, cubin, module);
-    if (!load_status.ok()) {
-      LOG(ERROR) << "failed to load CUBIN: " << load_status;
-      return false;
-    }
+    TF_RETURN_IF_ERROR(GpuDriver::LoadCubin(context_, cubin, module));
     module_refcount = 1;
     VLOG(3) << "Loaded CUBIN " << static_cast<const void *>(cubin)
             << " as module " << *module;
@@ -236,17 +233,15 @@ bool GpuExecutor::LoadModuleFromCuBin(const char* cubin, CUmodule* module) {
             << " is already loaded as module " << *module;
   }
   gpu_binary_to_module_[cubin] = {*module, module_refcount};
-  return true;
+  return port::Status::OK();
 }
 
-bool GpuExecutor::LoadModuleFromPtx(const char* ptx, CUmodule* module) {
+port::Status GpuExecutor::LoadModuleFromPtx(const char* ptx, CUmodule* module) {
   uint64_t module_refcount;
   std::tie(*module, module_refcount) = gpu_binary_to_module_[ptx];
 
   if (*module == nullptr) {
-    if (!GpuDriver::LoadPtx(context_, ptx, module)) {
-      return false;
-    }
+    TF_RETURN_IF_ERROR(GpuDriver::LoadPtx(context_, ptx, module));
     VLOG(3) << "Loaded PTX " << static_cast<const void *>(ptx) << " as module "
             << *module;
     module_refcount = 1;
@@ -256,7 +251,7 @@ bool GpuExecutor::LoadModuleFromPtx(const char* ptx, CUmodule* module) {
             << " is already loaded as module " << module;
   }
   gpu_binary_to_module_[ptx] = {*module, module_refcount};
-  return true;
+  return port::Status::OK();
 }
 
 bool GpuExecutor::LoadModuleFromHsaco(const char* hsaco, CUmodule* module) {
@@ -264,8 +259,8 @@ bool GpuExecutor::LoadModuleFromHsaco(const char* hsaco, CUmodule* module) {
   return false;
 }
 
-bool GpuExecutor::GetKernel(const MultiKernelLoaderSpec& spec,
-                            KernelBase* kernel) {
+port::Status GpuExecutor::GetKernel(const MultiKernelLoaderSpec& spec,
+                                    KernelBase* kernel) {
   GpuKernel* cuda_kernel = AsGpuKernel(kernel);
   CUmodule module;
   const string *kernelname;
@@ -273,18 +268,16 @@ bool GpuExecutor::GetKernel(const MultiKernelLoaderSpec& spec,
   VLOG(3) << "GetKernel on kernel " << kernel << " : " << kernel->name();
 
   if (spec.has_cuda_cubin_in_memory()) {
-    mutex_lock lock{in_memory_modules_mu_};
+    absl::MutexLock lock{&in_memory_modules_mu_};
     kernelname = &spec.cuda_cubin_in_memory().kernelname();
     const char *cubin = spec.cuda_cubin_in_memory().bytes();
-    if (!LoadModuleFromCuBin(cubin, &module)) {
-      return false;
-    }
+    TF_RETURN_IF_ERROR(LoadModuleFromCuBin(cubin, &module));
     kernel_to_gpu_binary_[kernel] = cubin;
   } else if (spec.has_cuda_ptx_in_memory()) {
     kernelname = &spec.cuda_ptx_in_memory().kernelname();
 
     if (cc_major_ == 0 && cc_minor_ == 0) {
-      return false;
+      return port::InternalError("Compute capability not set");
     }
 
     const char *ptx = spec.cuda_ptx_in_memory().text(cc_major_, cc_minor_);
@@ -292,23 +285,19 @@ bool GpuExecutor::GetKernel(const MultiKernelLoaderSpec& spec,
       ptx = spec.cuda_ptx_in_memory().default_text();
     }
     if (ptx == nullptr) {
-      LOG(FATAL) << "loader spec has no ptx for kernel " << *kernelname;
-      return false;
+      LOG(FATAL) << "Loader spec has no ptx for kernel " << *kernelname;
     }
 
-    mutex_lock lock{in_memory_modules_mu_};
-    if (!LoadModuleFromPtx(ptx, &module)) {
-      return false;
-    }
+    absl::MutexLock lock{&in_memory_modules_mu_};
+    TF_RETURN_IF_ERROR(LoadModuleFromPtx(ptx, &module));
     kernel_to_gpu_binary_[kernel] = ptx;
   } else {
-    LOG(WARNING) << "no method of loading CUDA kernel provided";
-    return false;
+    return port::InternalError("No method of loading CUDA kernel provided");
   }
   VLOG(2) << "getting function " << *kernelname << " from module " << module;
   if (!GpuDriver::GetModuleFunction(context_, module, kernelname->c_str(),
                                     cuda_kernel->gpu_function_ptr())) {
-    return false;
+    return port::InternalError("Could not find the corresponding function");
   }
 
   // We have to trust the kernel loader spec arity because there doesn't appear
@@ -321,7 +310,7 @@ bool GpuExecutor::GetKernel(const MultiKernelLoaderSpec& spec,
   }
   kernel->set_metadata(kernel_metadata);
   kernel->set_name(*kernelname);
-  return true;
+  return port::Status::OK();
 }
 
 bool GpuExecutor::UnloadGpuBinary(const void* gpu_binary) {
@@ -344,7 +333,7 @@ bool GpuExecutor::UnloadGpuBinary(const void* gpu_binary) {
 void GpuExecutor::UnloadKernel(const KernelBase* kernel) {
   VLOG(3) << "Unloading kernel " << kernel << " : " << kernel->name();
 
-  mutex_lock lock{in_memory_modules_mu_};
+  absl::MutexLock lock{&in_memory_modules_mu_};
   auto gpu_binary_it = kernel_to_gpu_binary_.find(kernel);
   if (kernel_to_gpu_binary_.end() == gpu_binary_it) {
     VLOG(3) << "Kernel " << kernel << " : " << kernel->name()
@@ -357,45 +346,41 @@ void GpuExecutor::UnloadKernel(const KernelBase* kernel) {
   kernel_to_gpu_binary_.erase(gpu_binary_it);
 }
 
-bool GpuExecutor::LoadModule(const MultiModuleLoaderSpec& spec,
-                             ModuleHandle* module_handle) {
+port::Status GpuExecutor::LoadModule(const MultiModuleLoaderSpec& spec,
+                                     ModuleHandle* module_handle) {
   // In GpuExecutor we store the pointer to the GPU binary (PTX or CUBIN) as
   // ModuleHandle::id().
   CUmodule cu_module;
   if (spec.has_cuda_cubin_in_memory()) {
-    mutex_lock lock{in_memory_modules_mu_};
-    if (!LoadModuleFromCuBin(
-            reinterpret_cast<const char *>(spec.cuda_cubin_in_memory().data()),
-            &cu_module)) {
-      return false;
-    }
+    absl::MutexLock lock{&in_memory_modules_mu_};
+    TF_RETURN_IF_ERROR(LoadModuleFromCuBin(
+        reinterpret_cast<const char*>(spec.cuda_cubin_in_memory().data()),
+        &cu_module));
     *module_handle = ModuleHandle(const_cast<void *>(
         static_cast<const void *>(spec.cuda_cubin_in_memory().data())));
-    return true;
+    return port::Status::OK();
   } else if (spec.has_cuda_ptx_in_memory()) {
     if (cc_major_ == 0 && cc_minor_ == 0) {
-      return false;
+      return port::InternalError("Compute capability not set");
     }
 
     if (!spec.cuda_ptx_in_memory()) {
-      return false;
+      return port::InternalError("PTX not found in spec");
     }
 
-    mutex_lock lock{in_memory_modules_mu_};
-    if (!LoadModuleFromPtx(spec.cuda_ptx_in_memory(), &cu_module)) {
-      return false;
-    }
+    absl::MutexLock lock{&in_memory_modules_mu_};
+    TF_RETURN_IF_ERROR(
+        LoadModuleFromPtx(spec.cuda_ptx_in_memory(), &cu_module));
     *module_handle = ModuleHandle(const_cast<void *>(
         static_cast<const void *>(spec.cuda_ptx_in_memory())));
-    return true;
+    return port::Status::OK();
   }
-  LOG(WARNING) << "no method of loading CUDA module provided";
-  return false;
+  return port::InternalError("No method of loading CUDA module provided");
 }
 
 bool GpuExecutor::UnloadModule(ModuleHandle module_handle) {
   const char *gpu_binary = reinterpret_cast<const char *>(module_handle.id());
-  mutex_lock lock{in_memory_modules_mu_};
+  absl::MutexLock lock{&in_memory_modules_mu_};
   return UnloadGpuBinary(gpu_binary);
 }
 
@@ -417,9 +402,10 @@ bool GpuExecutor::GetKernelMetadata(GpuKernel* cuda_kernel,
   return true;
 }
 
-bool GpuExecutor::Launch(Stream* stream, const ThreadDim& thread_dims,
-                         const BlockDim& block_dims, const KernelBase& kernel,
-                         const KernelArgsArrayBase& args) {
+port::Status GpuExecutor::Launch(Stream* stream, const ThreadDim& thread_dims,
+                                 const BlockDim& block_dims,
+                                 const KernelBase& kernel,
+                                 const KernelArgsArrayBase& args) {
   CHECK_EQ(kernel.Arity(), args.number_of_arguments());
   CUstream custream = AsGpuStreamValue(stream);
   const GpuKernel* cuda_kernel = AsGpuKernel(&kernel);
@@ -429,7 +415,7 @@ bool GpuExecutor::Launch(Stream* stream, const ThreadDim& thread_dims,
   // whether we've done an occupancy check on this kernel before isn't free
   // (because we have to synchronize), so we only do this at -v 2+.
   if (VLOG_IS_ON(2)) {
-    mutex_lock lock(launched_kernels_mu_);
+    absl::MutexLock lock(&launched_kernels_mu_);
     if (!launched_kernels_.count(cufunc)) {
       VlogOccupancyInfo(kernel, thread_dims, block_dims);
       // TODO(rspringer): Remove elements from launched_kernels_...if we ever
@@ -445,19 +431,10 @@ bool GpuExecutor::Launch(Stream* stream, const ThreadDim& thread_dims,
 
   void **kernel_params = const_cast<void **>(args.argument_addresses().data());
 
-  if (!GpuDriver::LaunchKernel(context_, cufunc, block_dims.x, block_dims.y,
-                               block_dims.z, thread_dims.x, thread_dims.y,
-                               thread_dims.z, args.number_of_shared_bytes(),
-                               custream, kernel_params,
-                               nullptr /* = extra */)) {
-    LOG(ERROR) << "failed to launch CUDA kernel " << kernel.name() << " with "
-               << args.number_of_arguments()
-               << " args; thread dim: " << thread_dims.ToString()
-               << "; block dim: " << block_dims.ToString();
-    return false;
-  }
-
-  return true;
+  return GpuDriver::LaunchKernel(
+      context_, cufunc, block_dims.x, block_dims.y, block_dims.z, thread_dims.x,
+      thread_dims.y, thread_dims.z, args.number_of_shared_bytes(), custream,
+      kernel_params, nullptr /* = extra */);
 }
 
 // This is a non-essential operation; if there's a failure, proceed without
@@ -712,8 +689,8 @@ port::Status GpuExecutor::WaitForEvent(Stream* stream, Event* event) {
   } else {
     return port::Status(
         port::error::INTERNAL,
-        port::Printf("error recording waiting for CUDA event on stream %p",
-                     stream));
+        absl::StrFormat("error recording waiting for CUDA event on stream %p",
+                        stream));
   }
 }
 
@@ -893,7 +870,7 @@ bool GpuExecutor::GetSymbol(const string& symbol_name,
   };
 
   {  // give limited scope to mutex_lock
-    mutex_lock lock{in_memory_modules_mu_};
+    absl::MutexLock lock{&in_memory_modules_mu_};
     if (static_cast<bool>(module_handle)) {
       auto it = gpu_binary_to_module_.find(module_handle.id());
       CHECK(it != gpu_binary_to_module_.end());
@@ -907,7 +884,7 @@ bool GpuExecutor::GetSymbol(const string& symbol_name,
     }
   }
 
-  LOG(INFO) << "Falied to find symbol in any modules: " << symbol_name;
+  LOG(INFO) << "Failed to find symbol in any modules: " << symbol_name;
   return false;
 }
 
@@ -982,7 +959,7 @@ static int TryToReadNumaNode(const string &pci_bus_id, int device_ordinal) {
   }
 
   string filename =
-      port::Printf("/sys/bus/pci/devices/%s/numa_node", pci_bus_id.c_str());
+      absl::StrFormat("/sys/bus/pci/devices/%s/numa_node", pci_bus_id);
 
   // We have to use fopen/fread here so that the device properties can be
   // populated before InitGoogle procedure has been completed (at which point we
@@ -1042,10 +1019,9 @@ GpuExecutor::CreateDeviceDescription(int device_ordinal) {
   {
     int driver_version = 0;
     (void)GpuDriver::GetDriverVersion(&driver_version);
-    string augmented_driver_version = port::Printf(
+    string augmented_driver_version = absl::StrFormat(
         "%d (%s)", driver_version,
-        cuda::DriverVersionStatusToString(Diagnostician::FindDsoVersion())
-            .c_str());
+        cuda::DriverVersionStatusToString(Diagnostician::FindDsoVersion()));
     builder.set_driver_version(augmented_driver_version);
   }
 
@@ -1053,7 +1029,7 @@ GpuExecutor::CreateDeviceDescription(int device_ordinal) {
     string pci_bus_id = GpuDriver::GetPCIBusID(device);
 
     // Lower the hex characters to match sysfs.
-    pci_bus_id = port::Lowercase(pci_bus_id);
+    pci_bus_id = absl::AsciiStrToLower(pci_bus_id);
     builder.set_pci_bus_id(pci_bus_id);
 
     // Read the NUMA node corresponding to the PCI bus ID out of sysfs.

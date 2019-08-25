@@ -33,14 +33,17 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "tensorflow/compiler/xla/comparison_util.h"
 #include "tensorflow/compiler/xla/layout_util.h"
 #include "tensorflow/compiler/xla/literal.h"
 #include "tensorflow/compiler/xla/literal_util.h"
+#include "tensorflow/compiler/xla/overflow_util.h"
 #include "tensorflow/compiler/xla/primitive_util.h"
 #include "tensorflow/compiler/xla/service/dfs_hlo_visitor_with_default.h"
 #include "tensorflow/compiler/xla/service/hlo_casting_utils.h"
 #include "tensorflow/compiler/xla/service/hlo_computation.h"
 #include "tensorflow/compiler/xla/service/hlo_creation_utils.h"
+#include "tensorflow/compiler/xla/service/hlo_evaluator.h"
 #include "tensorflow/compiler/xla/service/hlo_instruction.h"
 #include "tensorflow/compiler/xla/service/hlo_instructions.h"
 #include "tensorflow/compiler/xla/service/hlo_opcode.h"
@@ -58,6 +61,7 @@ limitations under the License.
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/stream_executor/lib/statusor.h"
 
 namespace xla {
 
@@ -166,12 +170,11 @@ bool IsUnstridedSlice(const HloInstruction* hlo) {
 // algebraic expressions to simplified forms. Note: This only supports
 // simplifications that simply look at the operands of an instruction. For the
 // more general case a worklist based approach would be needed.
-class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
+class AlgebraicSimplifierVisitor : public DfsHloRewriteVisitor {
  public:
-  // Default visitor action is to do nothing and return OK.
-  Status DefaultAction(HloInstruction* /*hlo_instruction*/) override {
-    return Status::OK();
-  }
+  explicit AlgebraicSimplifierVisitor(const AlgebraicSimplifierOptions& options,
+                                      AlgebraicSimplifier* simplifier)
+      : options_(options), simplifier_(simplifier) {}
 
   Status HandleAdd(HloInstruction* add) override;
 
@@ -182,6 +185,8 @@ class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
   Status HandleBitcastConvert(HloInstruction* bitcast) override;
 
   Status HandleBroadcast(HloInstruction* broadcast) override;
+
+  Status HandleCompare(HloInstruction* compare) override;
 
   Status HandleConcatenate(HloInstruction* concatenate) override;
 
@@ -205,9 +210,17 @@ class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
 
   Status HandleDot(HloInstruction* dot) override;
 
+  Status HandleGather(HloInstruction* gather) override;
+
   Status HandleGetTupleElement(HloInstruction* get_tuple_element) override;
 
   Status HandleLog(HloInstruction* log) override;
+
+  Status HandleMaximum(HloInstruction* maximum) override;
+
+  Status HandleMinimum(HloInstruction* minimum) override;
+
+  Status HandleClamp(HloInstruction* clamp) override;
 
   Status HandleMultiply(HloInstruction* multiply) override;
 
@@ -225,7 +238,7 @@ class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
 
   Status HandleReshape(HloInstruction* reshape) override;
 
-  Status HandleReduce(HloInstruction* reduce) override;
+  Status HandleReduce(HloInstruction* hlo) override;
 
   Status HandleReduceWindow(HloInstruction* reduce_window) override;
 
@@ -246,20 +259,12 @@ class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
 
   Status HandleMap(HloInstruction* map) override;
 
-  // Returns whether algebraic simplification has occurred.
-  const bool changed() const { return changed_; }
-
   // Runs the visitor on a computation.
-  static bool Run(HloComputation* computation,
-                  const AlgebraicSimplifierOptions& options,
-                  AlgebraicSimplifier* simplifier);
+  bool Run(HloComputation* computation,
+           const AlgebraicSimplifierOptions& options,
+           AlgebraicSimplifier* simplifier);
 
  private:
-  explicit AlgebraicSimplifierVisitor(HloComputation* computation,
-                                      const AlgebraicSimplifierOptions& options,
-                                      AlgebraicSimplifier* simplifier)
-      : computation_(computation), options_(options), simplifier_(simplifier) {}
-
   // Removes degenerate dimension from dot.
   StatusOr<bool> RemoveDegenerateDimensionFromDot(HloInstruction* dot);
 
@@ -346,41 +351,15 @@ class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
   StatusOr<bool> TryToSinkBroadcastAfterOpWithUniqueNonScalarOperand(
       HloInstruction* broadcast);
 
-  // Replaces the existing HLO instruction old_instruction, with
-  // new_instruction, and marks the optimizer status as changed.
-  // Returns the Status representing the result of the replace operation.
-  Status ReplaceWithNewInstruction(
-      HloInstruction* old_instruction,
-      std::unique_ptr<HloInstruction> new_instruction) {
-    VLOG(3) << "Replacing instruction:";
-    VLOG(3) << "  old: " << old_instruction->ToString();
-    VLOG(3) << "  new: " << new_instruction->ToString();
-    TF_RETURN_IF_ERROR(computation_->ReplaceWithNewInstruction(
-        old_instruction, std::move(new_instruction)));
-    changed_ = true;
-    return Status::OK();
-  }
-
-  // Replaces the existing HLO instruction old_instruction, with
-  // new_instruction, and marks the optimizer status as changed.
-  // Returns the Status representing the result of the replace operation.
-  Status ReplaceInstruction(HloInstruction* old_instruction,
-                            HloInstruction* new_instruction) {
-    VLOG(3) << "Replacing instruction:";
-    VLOG(3) << "  old: " << old_instruction->ToString();
-    VLOG(3) << "  new: " << new_instruction->ToString();
-    TF_RETURN_IF_ERROR(
-        computation_->ReplaceInstruction(old_instruction, new_instruction));
-    changed_ = true;
-    return Status::OK();
-  }
-
   StatusOr<HloInstruction*> OptimizeDotOfConcat(HloInstruction* dot);
   StatusOr<HloInstruction*> OptimizeDotOfConcatHelper(
       const HloInstruction& dot, HloInstruction* lhs, int64 lhs_contracting_dim,
       HloInstruction* rhs, int64 rhs_contracting_dim, bool swapped);
 
   StatusOr<HloInstruction*> OptimizeDotOfGather(HloInstruction* dot);
+
+  StatusOr<HloInstruction*> OptimizeDotOfReorderContractingDims(
+      HloInstruction* dot);
 
   HloComputation* GetOrCreateScalarAddComputation() {
     if (scalar_add_computation_) {
@@ -415,6 +394,9 @@ class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
   // Tries to convert slice(reshape(X)) into reshape(slice(X))
   StatusOr<bool> TryToReorderSliceAndReshape(HloInstruction* slice);
 
+  // Useful when we want to use the same visitor over multiple computations.
+  void ResetState(HloComputation* computation);
+
   // Current HloComputation instance the AlgebraicSimplifierVisitor is
   // traversing.
   HloComputation* computation_;
@@ -433,12 +415,18 @@ class AlgebraicSimplifierVisitor : public DfsHloVisitorWithDefault {
 
 }  // namespace
 
+void AlgebraicSimplifierVisitor::ResetState(HloComputation* computation) {
+  changed_ = false;
+  ResetVisitStates();
+  computation_ = computation;
+}
+
 bool AlgebraicSimplifierVisitor::Run(HloComputation* computation,
                                      const AlgebraicSimplifierOptions& options,
                                      AlgebraicSimplifier* simplifier) {
-  AlgebraicSimplifierVisitor visitor(computation, options, simplifier);
-  TF_CHECK_OK(computation->Accept(&visitor));
-  return visitor.changed_;
+  ResetState(computation);
+  TF_CHECK_OK(computation->Accept(this));
+  return changed_ || changed();
 }
 
 bool AlgebraicSimplifierVisitor::SameShape(const HloInstruction* lhs,
@@ -461,8 +449,8 @@ void AlgebraicSimplifierVisitor::ReplaceWithBitcast(HloInstruction* instruction,
   CHECK_EQ(ShapeUtil::ByteSizeOf(instruction->shape()),
            ShapeUtil::ByteSizeOf(operand->shape()));
 
-  auto bitcast = computation_->AddInstruction(HloInstruction::CreateUnary(
-      instruction->shape(), HloOpcode::kBitcast, operand));
+  auto bitcast = computation_->AddInstruction(
+      HloInstruction::CreateBitcast(instruction->shape(), operand));
   TF_CHECK_OK(ReplaceInstruction(instruction, bitcast));
 }
 
@@ -579,20 +567,20 @@ Status AlgebraicSimplifierVisitor::HandleAnd(HloInstruction* logical_and) {
     if (IsAll(lhs, 1) && ReplaceInstructionIfSameShape(logical_and, rhs)) {
       return Status::OK();
     }
+  }
 
-    // A && False => False
-    VLOG(10) << "trying transform [A && False => False]: "
-             << logical_and->ToString();
-    if (IsAll(rhs, 0) && ReplaceInstructionIfSameShape(logical_and, rhs)) {
-      return Status::OK();
-    }
+  // A && False => False or A & 0 => 0
+  VLOG(10) << "trying transform [A && False => False]: "
+           << logical_and->ToString();
+  if (IsAll(rhs, 0) && ReplaceInstructionIfSameShape(logical_and, rhs)) {
+    return Status::OK();
+  }
 
-    // False && A => False
-    VLOG(10) << "trying transform [False && A => False]: "
-             << logical_and->ToString();
-    if (IsAll(lhs, 0) && ReplaceInstructionIfSameShape(logical_and, lhs)) {
-      return Status::OK();
-    }
+  // False && A => False or A & 0 => 0
+  VLOG(10) << "trying transform [False && A => False]: "
+           << logical_and->ToString();
+  if (IsAll(lhs, 0) && ReplaceInstructionIfSameShape(logical_and, lhs)) {
+    return Status::OK();
   }
 
   return Status::OK();
@@ -603,8 +591,7 @@ Status AlgebraicSimplifierVisitor::HandleBitcast(HloInstruction* bitcast) {
   HloInstruction* op;
   if (Match(bitcast, m::Bitcast(m::Bitcast(m::Op(&op))))) {
     return ReplaceWithNewInstruction(
-        bitcast,
-        HloInstruction::CreateUnary(bitcast->shape(), HloOpcode::kBitcast, op));
+        bitcast, HloInstruction::CreateBitcast(bitcast->shape(), op));
   }
   // All bitcasts can be eliminated (assuming layout constraints are
   // satisified).
@@ -1231,7 +1218,8 @@ StatusOr<HloInstruction*> AlgebraicSimplifierVisitor::OptimizeDotOfConcat(
     HloInstruction* dot) {
   const DotDimensionNumbers& dnums = dot->dot_dimension_numbers();
   if (dnums.lhs_contracting_dimensions_size() != 1 ||
-      dnums.lhs_batch_dimensions_size() != 0) {
+      dnums.lhs_batch_dimensions_size() != 0 ||
+      dot->shape().dimensions_size() != 2) {  // dot output 2D
     return nullptr;
   }
 
@@ -1499,7 +1487,223 @@ StatusOr<HloInstruction*> AlgebraicSimplifierVisitor::OptimizeDotOfGather(
   return memoized_lookup;
 }
 
+// This function tries to transform
+//   dot(reshape(transpose(A)), Const) to
+//   dot(reshape(A), reshape(transpose(reshape(Const)))),
+// so that the reshape and transpose on the Const side can be constant folded.
+//
+// The basic idea is that since the accumulation in the dot operation is
+// associative, so as long as we permute the elements of the contracting
+// dimensions on both sides of the dot in the same way, the result of the
+// dot is not affected.
+StatusOr<HloInstruction*>
+AlgebraicSimplifierVisitor::OptimizeDotOfReorderContractingDims(
+    HloInstruction* dot) {
+  // This transformation assumes layout is not assigned yet.
+  if (options_.is_layout_sensitive()) {
+    return nullptr;
+  }
+
+  // Canonicalize dot(<constant>, rhs) to dot(rhs, <constant>) to make the
+  // remainder of this function easier.
+  auto dnums = dot->dot_dimension_numbers();
+  auto lhs_contracting_dims = dnums.lhs_contracting_dimensions();
+  auto rhs_contracting_dims = dnums.rhs_contracting_dimensions();
+  auto* lhs = dot->mutable_operand(0);
+  auto* rhs = dot->mutable_operand(1);
+  if (dot->operand(0)->IsConstant()) {
+    std::swap(lhs, rhs);
+    std::swap(lhs_contracting_dims, rhs_contracting_dims);
+  }
+
+  // Require single contracting dim to make the implementation easier to
+  // track contracting dims.
+  if (dnums.lhs_contracting_dimensions_size() != 1) {
+    return nullptr;
+  }
+
+  // Pattern match Dot(reshape(transpose(input), constant))
+  HloInstruction* reshape;
+  HloInstruction* transpose;
+  HloInstruction* input;
+  HloInstruction* constant;
+  if (!Match(lhs,
+             m::Reshape(&reshape, m::Transpose(&transpose, m::Op(&input)))) ||
+      !Match(rhs, m::Constant(&constant))) {
+    return nullptr;
+  }
+
+  // Check that reshape squishes some dims into one dim and that this one
+  // dim is the dot's lhs contracting dim. The size of unmodified_dims should
+  // be N - 1, where N is the rank of the reshape output. This means that the
+  // reshape squishes some dims into one dim. lhs contracting dim should not
+  // be in unmodified_dims. This means that the squishing target dim is the
+  // lhs contracting dim.
+  auto unmodified_dims = ShapeUtil::DimensionsUnmodifiedByReshape(
+      reshape->operand(0)->shape(), reshape->shape());
+  CHECK_EQ(lhs_contracting_dims.size(), 1);
+  if ((unmodified_dims.size() != reshape->shape().rank() - 1) ||
+      absl::c_any_of(unmodified_dims, [&](const std::pair<int64, int64>& p) {
+        return p.second == lhs_contracting_dims[0];
+      })) {
+    return nullptr;
+  }
+
+  // Virtually pull the reshape into the dot so the dot operates on the
+  // transpose, with "unsquished" lhs contracting dims.  The new contracting
+  // dims are all of the dims that are modified by the reshape -- that is, every
+  // dimension that's not in `unmodified_dims[i].first`.
+  //
+  // (We don't need to actually create a new dot instruction. We can just keep
+  // track of lhs and lhs_contracting_dims.)
+  absl::flat_hash_set<int64> unmodified_transpose_dims;
+  for (const auto& pair : unmodified_dims) {
+    unmodified_transpose_dims.insert(pair.first);
+  }
+  lhs_contracting_dims.Clear();
+  for (int64 i = 0; i < transpose->shape().dimensions_size(); ++i) {
+    if (!unmodified_transpose_dims.contains(i)) {
+      lhs_contracting_dims.Add(i);
+    }
+  }
+  // We require the "unsquished" lhs contracting dims to be consecutive.
+  auto is_iota = [](absl::Span<const int64> dims) {
+    return absl::c_adjacent_find(dims, [](const int64 a, const int64 b) {
+             return (b != a + 1);
+           }) == dims.end();
+  };
+  if (!is_iota(AsInt64Slice(lhs_contracting_dims))) {
+    return nullptr;
+  }
+  lhs = lhs->mutable_operand(0);
+
+  // Check that the transpose only permutes the contracting dims.
+  const auto& transpose_dims = transpose->dimensions();
+  for (int64 i = 0; i < transpose_dims.size(); ++i) {
+    if (transpose_dims[i] != i &&
+        !absl::c_linear_search(lhs_contracting_dims, i)) {
+      return nullptr;
+    }
+  }
+  // Virtually pull the transpose into the dot. Now the dot is equivalent to
+  // a new dot with "permuted" lhs contracting dims.
+  std::vector<int64> permutation;
+  for (auto dim : lhs_contracting_dims) {
+    permutation.push_back(transpose_dims[dim] - lhs_contracting_dims[0]);
+  }
+  CHECK(IsPermutation(permutation, permutation.size()));
+  auto new_lhs_contracting_dims =
+      ComposePermutations(AsInt64Slice(lhs_contracting_dims), permutation);
+  lhs_contracting_dims.Clear();
+  for (auto dim : new_lhs_contracting_dims) {
+    lhs_contracting_dims.Add(dim);
+  }
+  lhs = lhs->mutable_operand(0);
+
+  // All checks are passed at this point.
+  //
+  // Transform lhs. Remove the transpose and reshape by sorting the lhs
+  // contracting dims and squishing them into a single one. We don't actually
+  // squish the lhs_contracting_dims here because we still need the unsquished
+  // contracting dims to invert reshape and transpose.
+  absl::c_sort(lhs_contracting_dims);
+  lhs = computation_->AddInstruction(
+      HloInstruction::CreateReshape(reshape->shape(), lhs));
+
+  // Transform rhs. Say the input HLO is:
+  //
+  //   t0 = f32[2, 2, 3] parameter(0)
+  //   t1 = f32[2, 3, 2] transpose(t0) dimensions={0, 2, 1}
+  //   t2 = f32[2, 6] reshape(t1)
+  //   t3 = f32[6, 2] constant(...)
+  //   dot = f32[2, 2] dot(t2, t3) lhs_contracting_dims={1},
+  //                               rhs_contracting_dims={0}
+  //
+  // At this point in the function, we have decided that the second and third
+  // dims of t0 can be switched to remove the transpose, and we have
+  // "virtually decomposed" the input HLO to:
+  //
+  //   t0 = f32[2, 2, 3] parameter(0)
+  //   t2' = f32[2, 6] reshape(t0)
+  //   t3' = f32[6, 2] ops-to-be-filled ...
+  //   dot = f32[2, 2] dot(t2', t3') lhs_contracting_dims={1},
+  //                                 rhs_contracting_dims={0}
+  //
+  // The rest of this function is to fill in the ops of t3'. To do this, we
+  // unsquish the contracting dimensions in t3 and then apply the inverse of
+  // the transpose from t1.
+
+  // Invert reshape.
+  CHECK_EQ(rhs_contracting_dims.size(), 1);
+  auto rhs_unsquished_shape_dims = constant->shape().dimensions();
+  auto it = rhs_unsquished_shape_dims.erase(rhs_unsquished_shape_dims.begin() +
+                                            rhs_contracting_dims[0]);
+  for (auto dim : lhs_contracting_dims) {
+    it = rhs_unsquished_shape_dims.insert(it,
+                                          transpose->shape().dimensions(dim));
+    ++it;
+  }
+  HloInstruction* rhs_reshape =
+      computation_->AddInstruction(HloInstruction::CreateReshape(
+          ShapeUtil::MakeShape(constant->shape().element_type(),
+                               rhs_unsquished_shape_dims),
+          constant));
+  rhs = rhs_reshape;
+
+  // Rhs reshape "unsquishes" the single rhs contracting dim into multiple dims.
+  rhs_contracting_dims.Resize(lhs_contracting_dims.size(),
+                              rhs_contracting_dims[0]);
+  absl::c_iota(rhs_contracting_dims, rhs_contracting_dims[0]);
+
+  // Invert transpose. First compute the shape.
+  auto rhs_transpose_shape_dims = rhs_reshape->shape().dimensions();
+  it = rhs_transpose_shape_dims.erase(
+      rhs_transpose_shape_dims.begin() + rhs_contracting_dims[0],
+      rhs_transpose_shape_dims.begin() + rhs_contracting_dims[0] +
+          rhs_contracting_dims.size());
+  for (auto dim : lhs_contracting_dims) {
+    it = rhs_transpose_shape_dims.insert(it, input->shape().dimensions(dim));
+    ++it;
+  }
+  // Then compute the transpose dims.
+  std::vector<int64> rhs_transpose_dims(rhs_reshape->shape().rank());
+  absl::c_iota(rhs_transpose_dims, 0);
+  it = rhs_transpose_dims.erase(
+      rhs_transpose_dims.begin() + rhs_contracting_dims[0],
+      rhs_transpose_dims.begin() + rhs_contracting_dims[0] +
+          rhs_contracting_dims.size());
+  auto inverse_lhs_transpose_dims = InversePermutation(transpose_dims);
+  for (auto dim : lhs_contracting_dims) {
+    it = rhs_transpose_dims.insert(it, inverse_lhs_transpose_dims[dim] -
+                                           lhs_contracting_dims[0] +
+                                           rhs_contracting_dims[0]);
+    ++it;
+  }
+  HloInstruction* rhs_transpose =
+      computation_->AddInstruction(HloInstruction::CreateTranspose(
+          ShapeUtil::MakeShape(constant->shape().element_type(),
+                               rhs_transpose_shape_dims),
+          rhs_reshape, rhs_transpose_dims));
+  rhs = rhs_transpose;
+
+  // Squish the multiple rhs contracting dims into a single one.
+  rhs = computation_->AddInstruction(
+      HloInstruction::CreateReshape(constant->shape(), rhs));
+
+  // If we virtually swapped lhs and rhs, we need to swap it back before
+  // creating new dot.
+  if (dot->operand(0)->IsConstant()) {
+    std::swap(lhs, rhs);
+  }
+
+  HloInstruction* new_dot =
+      computation_->AddInstruction(HloInstruction::CreateDot(
+          dot->shape(), lhs, rhs, dnums, dot->precision_config()));
+  return new_dot;
+}
+
 Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
+  CHECK(computation_ == dot->parent());
   HloInstruction *lhs, *rhs;
   CHECK(Match(dot, m::Dot(m::Op(&lhs), m::Op(&rhs))));
   if (options_.is_layout_sensitive()) {
@@ -1516,15 +1720,10 @@ Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
         dot, HloInstruction::CreateBroadcast(dot->shape(), zero, {}));
   }
 
-  // Only optimize F32 or BF16 dot operations where the dot, rhs and lhs.
-  if (dot->shape().element_type() != F32 &&
-      dot->shape().element_type() != BF16) {
-    return Status::OK();
-  }
-
   // If there are no contracting dimensions, a dot can be rewritten as
   // mul(broadcast(transpose(x)),broadcast(transpose(y)))
-  if (dot->dot_dimension_numbers().lhs_contracting_dimensions_size() == 0) {
+  if (options_.enable_dot_to_multiply_rewrite() &&
+      dot->dot_dimension_numbers().lhs_contracting_dimensions_size() == 0) {
     TF_ASSIGN_OR_RETURN(
         HloInstruction * new_lhs,
         NormalizeDotOperandToBatchMajorAndContractingMinor(
@@ -1562,12 +1761,16 @@ Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
 
   // If the lhs or rhs have only batch and contracting dimensions, a dot can be
   // rewritten as reduce(mul(broadcast(transpose(x)),broadcast(transpose(y))))
-  if ((dot->dot_dimension_numbers().lhs_batch_dimensions_size() +
-           dot->dot_dimension_numbers().lhs_contracting_dimensions_size() ==
-       lhs->shape().rank()) ||
-      (dot->dot_dimension_numbers().rhs_contracting_dimensions_size() +
-           dot->dot_dimension_numbers().rhs_batch_dimensions_size() ==
-       rhs->shape().rank())) {
+  if (options_.enable_dot_strength_reduction() &&
+      (dot->shape().element_type() == F32 ||
+       dot->shape().element_type() == F16 ||
+       dot->shape().element_type() == BF16) &&
+      ((dot->dot_dimension_numbers().lhs_batch_dimensions_size() +
+            dot->dot_dimension_numbers().lhs_contracting_dimensions_size() ==
+        lhs->shape().rank()) ||
+       (dot->dot_dimension_numbers().rhs_contracting_dimensions_size() +
+            dot->dot_dimension_numbers().rhs_batch_dimensions_size() ==
+        rhs->shape().rank()))) {
     TF_ASSIGN_OR_RETURN(
         HloInstruction * new_lhs,
         NormalizeDotOperandToBatchMajorAndContractingMinor(
@@ -1632,6 +1835,18 @@ Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     return ReplaceInstruction(dot, new_dot);
   }
 
+  // Simplify dot(reshape(transpose(A)), Const) to:
+  // dot(reshape(A), reshape(transpose(reshape(Const)))), so that the reshape
+  // and transpose on the Const side can be constant folded.
+  TF_ASSIGN_OR_RETURN(HloInstruction * dot_of_reorder_optimized,
+                      OptimizeDotOfReorderContractingDims(dot));
+  if (dot_of_reorder_optimized) {
+    VLOG(10) << " Replaced dot " << dot->ToString()
+             << " with new dot operation: "
+             << dot_of_reorder_optimized->ToString();
+    return ReplaceInstruction(dot, dot_of_reorder_optimized);
+  }
+
   TF_ASSIGN_OR_RETURN(HloInstruction * dot_of_concat_optimized,
                       OptimizeDotOfConcat(dot));
   if (dot_of_concat_optimized) {
@@ -1651,12 +1866,10 @@ Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     return ReplaceInstruction(dot, dot_of_gather_optimized);
   }
 
-  if (options_.enable_dot_strength_reduction()) {
-    TF_ASSIGN_OR_RETURN(bool removed_degenerate_dimensions,
-                        RemoveDegenerateDimensionFromDot(dot));
-    if (removed_degenerate_dimensions) {
-      return Status::OK();
-    }
+  TF_ASSIGN_OR_RETURN(bool removed_degenerate_dimensions,
+                      RemoveDegenerateDimensionFromDot(dot));
+  if (removed_degenerate_dimensions) {
+    return Status::OK();
   }
 
   // Simplify dot(transpose(a), transpose(b)) to transpose(dot(b,a)).
@@ -1674,6 +1887,175 @@ Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
         dot->precision_config()));
     return ReplaceWithNewInstruction(
         dot, HloInstruction::CreateTranspose(dot->shape(), new_dot, {1, 0}));
+  }
+
+  return Status::OK();
+}
+
+Status AlgebraicSimplifierVisitor::HandleGather(HloInstruction* gather) {
+  const Shape& operand_shape = gather->operand(0)->shape();
+  // If the operand of a gather is very small, it is easier to fuse a
+  // sequence of selects.
+  if (operand_shape.rank() == 1 &&
+      operand_shape.dimensions(0) <= options_.very_small_gather_size() &&
+      gather->gather_dimension_numbers().index_vector_dim() ==
+          gather->operand(1)->shape().rank() &&
+      gather->gather_dimension_numbers().collapsed_slice_dims_size() == 1) {
+    const Shape& index_shape = gather->operand(1)->shape();
+    const int64 operand_elements = operand_shape.dimensions(0);
+    auto get_value = [&](int64 i) {
+      auto slice = computation_->AddInstruction(HloInstruction::CreateSlice(
+          ShapeUtil::MakeShape(operand_shape.element_type(), {1}),
+          gather->mutable_operand(0), {i}, {i + 1}, {1}));
+      auto scalar = computation_->AddInstruction(HloInstruction::CreateReshape(
+          ShapeUtil::MakeShape(operand_shape.element_type(), {}), slice));
+      return computation_->AddInstruction(
+          HloInstruction::CreateBroadcast(gather->shape(), scalar, {}));
+    };
+    auto result = get_value(0);
+    auto one = computation_->AddInstruction(HloInstruction::CreateConstant(
+        LiteralUtil::One(index_shape.element_type())));
+    auto index = one;
+    auto pred_shape = ShapeUtil::ChangeElementType(gather->shape(), PRED);
+    auto iter_shape = ShapeUtil::ChangeElementType(gather->shape(),
+                                                   index_shape.element_type());
+    for (int64 i = 1; i < operand_elements; ++i) {
+      auto broadcasted_index = computation_->AddInstruction(
+          HloInstruction::CreateBroadcast(iter_shape, index, {}));
+      auto index_mask =
+          computation_->AddInstruction(HloInstruction::CreateCompare(
+              pred_shape, gather->mutable_operand(1), broadcasted_index,
+              ComparisonDirection::kGe));
+      result = computation_->AddInstruction(
+          HloInstruction::CreateTernary(gather->shape(), HloOpcode::kSelect,
+                                        index_mask, get_value(i), result));
+      index = computation_->AddInstruction(HloInstruction::CreateBinary(
+          index->shape(), HloOpcode::kAdd, index, one));
+    }
+    return ReplaceInstruction(gather, result);
+  }
+  return Status::OK();
+}
+
+namespace {
+StatusOr<std::unique_ptr<HloInstruction>> MinMaxToClamp(
+    HloInstruction* clamp_lower_bound_bcast, HloInstruction* to_clamp,
+    HloInstruction* clamp_upper_bound_bcast) {
+  HloInstruction* clamp_lower_bound;
+  CHECK(Match(clamp_lower_bound_bcast,
+              m::Broadcast(m::ConstantEffectiveScalar(&clamp_lower_bound))))
+      << clamp_lower_bound_bcast->ToString();
+
+  HloInstruction* clamp_upper_bound;
+  CHECK(Match(clamp_upper_bound_bcast,
+              m::Broadcast(m::ConstantEffectiveScalar(&clamp_upper_bound))))
+      << clamp_upper_bound_bcast->ToString();
+
+  const Literal& lower_bound =
+      Cast<HloConstantInstruction>(clamp_lower_bound)->literal();
+  const Literal& upper_bound =
+      Cast<HloConstantInstruction>(clamp_upper_bound)->literal();
+
+  std::unique_ptr<HloInstruction> lower_bound_instr =
+      HloInstruction::CreateConstant(lower_bound.Clone());
+  std::unique_ptr<HloInstruction> upper_bound_instr =
+      HloInstruction::CreateConstant(upper_bound.Clone());
+
+  std::unique_ptr<HloInstruction> cloned_instruction =
+      HloInstruction::CreateCompare(
+          ShapeUtil::ChangeElementType(lower_bound_instr->shape(), PRED),
+          lower_bound_instr.get(), upper_bound_instr.get(),
+          ComparisonDirection::kLt);
+
+  HloEvaluator evaluator;
+  TF_ASSIGN_OR_RETURN(auto result,
+                      evaluator.Evaluate(cloned_instruction.get()));
+  if (result.IsAll(true)) {
+    return HloInstruction::CreateTernary(to_clamp->shape(), HloOpcode::kClamp,
+                                         clamp_lower_bound_bcast, to_clamp,
+                                         clamp_upper_bound_bcast);
+  }
+  return std::unique_ptr<HloInstruction>();
+}
+}  // namespace
+
+Status AlgebraicSimplifierVisitor::HandleMaximum(HloInstruction* maximum) {
+  HloInstruction *lhs, *rhs;
+  CHECK(Match(maximum, m::Maximum(m::Op(&lhs), m::Op(&rhs))));
+
+  HloInstruction* clamp_upper_bound_bcast;
+  HloInstruction* clamp_lower_bound_bcast;
+  HloInstruction* to_clamp;
+  if (Match(maximum, m::MaximumAnyOrder(
+                         m::Broadcast(&clamp_lower_bound_bcast,
+                                      m::ConstantEffectiveScalar()),
+                         m::MinimumAnyOrder(
+                             m::Op(&to_clamp),
+                             m::Broadcast(&clamp_upper_bound_bcast,
+                                          m::ConstantEffectiveScalar()))))) {
+    TF_ASSIGN_OR_RETURN(auto clamp,
+                        MinMaxToClamp(clamp_lower_bound_bcast, to_clamp,
+                                      clamp_upper_bound_bcast));
+    if (clamp) {
+      return ReplaceWithNewInstruction(maximum, std::move(clamp));
+    }
+  }
+
+  HloInstruction* clamp_lower_bound;
+  HloInstruction* clamp_upper_bound;
+  HloInstruction* max_operand;
+  HloInstruction* clamp;
+  if (Match(maximum,
+            m::MaximumAnyOrder(
+                m::Op(&max_operand),
+                m::Clamp(&clamp, m::Op(&clamp_lower_bound), m::Op(&to_clamp),
+                         m::Op(&clamp_upper_bound))))) {
+    if (max_operand == clamp_lower_bound &&
+        ReplaceInstructionIfSameShape(maximum, clamp)) {
+      return Status::OK();
+    }
+  }
+
+  return Status::OK();
+}
+
+Status AlgebraicSimplifierVisitor::HandleMinimum(HloInstruction* minimum) {
+  HloInstruction *lhs, *rhs;
+  CHECK(Match(minimum, m::Minimum(m::Op(&lhs), m::Op(&rhs))));
+
+  HloInstruction* clamp_upper_bound_bcast;
+  HloInstruction* clamp_lower_bound_bcast;
+  HloInstruction* to_clamp;
+  if (Match(minimum, m::MinimumAnyOrder(
+                         m::Broadcast(&clamp_upper_bound_bcast,
+                                      m::ConstantEffectiveScalar()),
+                         m::MaximumAnyOrder(
+                             m::Op(&to_clamp),
+                             m::Broadcast(&clamp_lower_bound_bcast,
+                                          m::ConstantEffectiveScalar()))))) {
+    TF_ASSIGN_OR_RETURN(auto clamp,
+                        MinMaxToClamp(clamp_lower_bound_bcast, to_clamp,
+                                      clamp_upper_bound_bcast));
+    if (clamp) {
+      return ReplaceWithNewInstruction(minimum, std::move(clamp));
+    }
+  }
+
+  return Status::OK();
+}
+
+Status AlgebraicSimplifierVisitor::HandleClamp(HloInstruction* clamp) {
+  HloInstruction* clamp_lower_bound;
+  HloInstruction* clamp_upper_bound;
+  HloInstruction* to_clamp;
+  CHECK(Match(clamp, m::Clamp(m::Op(&clamp_lower_bound), m::Op(&to_clamp),
+                              m::Op(&clamp_upper_bound))));
+
+  // clamp(a, clamp(a, x, b), b) -> clamp(a, x, b)
+  if (Match(to_clamp, m::Clamp(m::Op().Is(clamp_lower_bound), m::Op(),
+                               m::Op().Is(clamp_upper_bound))) &&
+      ReplaceInstructionIfSameShape(clamp, to_clamp)) {
+    return Status::OK();
   }
 
   return Status::OK();
@@ -1712,9 +2094,9 @@ Status AlgebraicSimplifierVisitor::HandleMultiply(HloInstruction* multiply) {
             m::Multiply(m::Multiply(m::NonConstant(&a), m::Constant(&c1)),
                         m::Constant(&c2))) ||
       Match(multiply,
-            m::Multiply(m::Multiply(m::NonConstant(&a),
-                                    m::Broadcast(m::ConstantScalar(&c1))),
-                        m::Broadcast(m::ConstantScalar(&c2))))) {
+            m::Multiply(
+                m::Multiply(m::Op(&a), m::Broadcast(m::ConstantScalar(&c1))),
+                m::Broadcast(m::ConstantScalar(&c2))))) {
     TF_ASSIGN_OR_RETURN(auto* product_of_constants,
                         MakeBinaryHlo(HloOpcode::kMultiply, c1, c2));
     if (ShapeUtil::IsScalar(product_of_constants->shape()) &&
@@ -1779,20 +2161,18 @@ Status AlgebraicSimplifierVisitor::HandleOr(HloInstruction* logical_or) {
     if (IsAll(lhs, 1) && ReplaceInstructionIfSameShape(logical_or, lhs)) {
       return Status::OK();
     }
+  }
 
-    // A || False => A
-    VLOG(10) << "trying transform [A || False => A]: "
-             << logical_or->ToString();
-    if (IsAll(rhs, 0) && ReplaceInstructionIfSameShape(logical_or, lhs)) {
-      return Status::OK();
-    }
+  // A || False => A and A | 0 => A
+  VLOG(10) << "trying transform [A || False => A]: " << logical_or->ToString();
+  if (IsAll(rhs, 0) && ReplaceInstructionIfSameShape(logical_or, lhs)) {
+    return Status::OK();
+  }
 
-    // False || A => A
-    VLOG(10) << "trying transform [False || A => A]: "
-             << logical_or->ToString();
-    if (IsAll(lhs, 0) && ReplaceInstructionIfSameShape(logical_or, rhs)) {
-      return Status::OK();
-    }
+  // False || A => A and 0 | A => A
+  VLOG(10) << "trying transform [False || A => A]: " << logical_or->ToString();
+  if (IsAll(lhs, 0) && ReplaceInstructionIfSameShape(logical_or, rhs)) {
+    return Status::OK();
   }
 
   return Status::OK();
@@ -1993,6 +2373,49 @@ Status AlgebraicSimplifierVisitor::HandleBroadcast(HloInstruction* broadcast) {
   return Status::OK();
 }
 
+Status AlgebraicSimplifierVisitor::HandleCompare(HloInstruction* compare) {
+  HloInstruction* lhs;
+  HloInstruction* rhs;
+  CHECK(Match(compare, m::Compare(m::Op(&lhs), m::Op(&rhs))));
+
+  auto replace_with_pred_broadcast = [&](bool value) {
+    return ReplaceWithNewInstruction(
+        compare,
+        HloInstruction::CreateBroadcast(
+            compare->shape(),
+            computation_->AddInstruction(
+                HloInstruction::CreateConstant(LiteralUtil::CreateR0(value))),
+            {}));
+  };
+  if (compare->comparison_direction() == ComparisonDirection::kLt &&
+      lhs->opcode() == HloOpcode::kIota && IsAll(rhs, 0)) {
+    return replace_with_pred_broadcast(false);
+  } else if (compare->comparison_direction() == ComparisonDirection::kGt &&
+             IsAll(lhs, 0) && rhs->opcode() == HloOpcode::kIota) {
+    return replace_with_pred_broadcast(false);
+  } else if (compare->comparison_direction() == ComparisonDirection::kGe &&
+             lhs->opcode() == HloOpcode::kIota && IsAll(rhs, 0)) {
+    return replace_with_pred_broadcast(true);
+  } else if (compare->comparison_direction() == ComparisonDirection::kLe &&
+             IsAll(lhs, 0) && rhs->opcode() == HloOpcode::kIota) {
+    return replace_with_pred_broadcast(true);
+  }
+  if (lhs == rhs &&
+      primitive_util::IsIntegralType(lhs->shape().element_type())) {
+    switch (compare->comparison_direction()) {
+      case ComparisonDirection::kGt:
+      case ComparisonDirection::kLt:
+      case ComparisonDirection::kNe:
+        return replace_with_pred_broadcast(false);
+      case ComparisonDirection::kEq:
+      case ComparisonDirection::kGe:
+      case ComparisonDirection::kLe:
+        return replace_with_pred_broadcast(true);
+    }
+  }
+  return Status::OK();
+}
+
 // A conversion to the same element type as the operand is a nop and can be
 // removed.  A conversion of a constant can be simplified by making a new
 // constant.
@@ -2148,9 +2571,11 @@ Status AlgebraicSimplifierVisitor::HandlePad(HloInstruction* pad) {
     TF_ASSIGN_OR_RETURN(
         HloInstruction * slice,
         MakeSliceHlo(nonzero_pad, start_indices, end_indices, strides));
+    TF_RETURN_IF_ERROR(LayoutUtil::CopyLayoutBetweenShapes(
+        pad->shape(), slice->mutable_shape()));
 
     // Verify that the slice shape matches the pad shape.
-    TF_RET_CHECK(ShapeUtil::Compatible(slice->shape(), pad->shape()));
+    TF_RET_CHECK(ShapeUtil::Equal(slice->shape(), pad->shape()));
 
     return ReplaceInstruction(pad, slice);
   }
@@ -2388,6 +2813,11 @@ Status AlgebraicSimplifierVisitor::HandleRemainder(HloInstruction* remainder) {
   HloInstruction *a, *b;
   CHECK(Match(remainder, m::Remainder(m::Op(&a), m::Op(&b))));
 
+  // (A % B) % B == A % B.
+  if (Match(a, m::Remainder(m::Op(), m::Op().Is(b)))) {
+    return ReplaceInstruction(remainder, a);
+  }
+
   // A % B => A & (B - 1) if B is a power of 2.
   switch (remainder->shape().element_type()) {
     case S8:
@@ -2440,6 +2870,65 @@ Status AlgebraicSimplifierVisitor::HandleRemainder(HloInstruction* remainder) {
       break;
     default:
       break;
+  }
+
+  // If M < N, then {0, ..., M} % N ==> {0, ..., M}.
+  //
+  // Currently this only covers the case when N is a broadcasted constant
+  // scalar.  We could also cover the case when N is a non-broadcasted constant
+  // with the same value repeated.
+  HloInstruction* iota;
+  HloInstruction* divisor;
+  if (Match(remainder,
+            m::Remainder(m::Iota(&iota),
+                         m::Broadcast(m::ConstantEffectiveScalar(&divisor))))) {
+    // The iota counts {0, ..., iota_upper_bound - 1}.  (Actually this is
+    // conservative; the iota may overflow and count up to a smaller value than
+    // this.  But that's OK for our purposes here.)
+    int64 iota_upper_bound = iota->shape().dimensions(
+        Cast<HloIotaInstruction>(iota)->iota_dimension());
+    absl::optional<int64> divisor_val = divisor->literal().GetIntegralAsS64(
+        std::vector<int64>(0, divisor->shape().dimensions_size()));
+    if (divisor_val && *divisor_val >= iota_upper_bound) {
+      return ReplaceInstruction(remainder, iota);
+    }
+  }
+
+  // (X + N) % N = X % N, so long as X + N does not overflow.
+  //
+  // We don't have range tracking in XLA that would let us know whether X + N
+  // overflows, so for now we only do this simplification when X is an iota.  We
+  // could add other operations where it's easy to see a range, such as
+  // remainder, convert, etc., though at some point we'd probably want a
+  // range-tracking analysis.
+  HloInstruction* bcast;
+  HloInstruction* addend;
+  if (Match(
+          remainder,
+          m::Remainder(
+              m::AddAnyOrder(m::Iota(&iota),
+                             m::Broadcast(m::ConstantEffectiveScalar(&addend))),
+              m::Broadcast(&bcast, m::ConstantEffectiveScalar(&divisor)))) &&
+      addend == divisor) {
+    // The iota counts {0, ...iota_upper_bound - 1}, with the same caveat above
+    // that iota_upper_bound is conservative, and the true upper bound may be
+    // smaller.
+    int64 iota_upper_bound = iota->shape().dimensions(
+        Cast<HloIotaInstruction>(iota)->iota_dimension());
+    absl::optional<int64> divisor_val = divisor->literal().GetIntegralAsS64(
+        std::vector<int64>(0, divisor->shape().dimensions_size()));
+    if (divisor_val) {
+      // Check whether divisor_val + iota_upper_bound - 1 overflows.
+      absl::optional<int64> max_val =
+          OverflowSafeAdd(*divisor_val, iota_upper_bound);
+      if (max_val.has_value() &&
+          FitsInIntegralType(*max_val, iota->shape().element_type())) {
+        return ReplaceWithNewInstruction(
+            remainder,
+            HloInstruction::CreateBinary(remainder->shape(),
+                                         HloOpcode::kRemainder, iota, bcast));
+      }
+    }
   }
 
   return Status::OK();
@@ -3025,12 +3514,6 @@ Status AlgebraicSimplifierVisitor::HandleReduceWindow(
     return Status::OK();
   }
 
-  // Bail on dilation.
-  if (window_util::HasDilation(window)) {
-    VLOG(10) << "Not folding pad into reduce-window as there is dilation.";
-    return Status::OK();
-  }
-
   VLOG(10) << "Considering folding Pad: " << pad->ToString()
            << "\ninto reduce-window: " << reduce_window->ToString()
            << (convert != nullptr
@@ -3040,8 +3523,8 @@ Status AlgebraicSimplifierVisitor::HandleReduceWindow(
   // Do not fold interior padding into ReduceWindow since the backends do not
   // support it.
   const PaddingConfig& pad_config = pad->padding_config();
-  if (HasInteriorPadding(pad_config)) {
-    VLOG(10) << "Not folding pad into reduce-window due to interior padding.";
+  if (HasInteriorPadding(pad_config) && window_util::HasBaseDilation(window)) {
+    VLOG(10) << "Not folding interior pad into base-dilated reduce-window.";
     return Status::OK();
   }
 
@@ -3084,6 +3567,10 @@ Status AlgebraicSimplifierVisitor::HandleReduceWindow(
     }
     if (!window_util::HasSymmetricPadding(pad_config)) {
       VLOG(10) << "Window has uneven padding.";
+      return false;
+    }
+    if (HasInteriorPadding(pad_config)) {
+      VLOG(10) << "Window has interior padding.";
       return false;
     }
     for (int64 i = 0; i < pad_config.dimensions_size(); ++i) {
@@ -3156,6 +3643,10 @@ Status AlgebraicSimplifierVisitor::HandleReduceWindow(
                                pad_dim.edge_padding_low());
     window_dim.set_padding_high(window_dim.padding_high() +
                                 pad_dim.edge_padding_high());
+    if (pad_dim.interior_padding() != 0) {
+      CHECK_EQ(window_dim.base_dilation(), 1);
+      window_dim.set_base_dilation(1 + pad_dim.interior_padding());
+    }
   }
 
   return ReplaceWithNewInstruction(
@@ -3244,6 +3735,38 @@ Status AlgebraicSimplifierVisitor::HandleTranspose(HloInstruction* transpose) {
                        transpose->shape(), operand->mutable_operand(0),
                        ComposePermutations(operand->dimensions(),
                                            transpose->dimensions())));
+  }
+
+  // Convert transpose(dot(a,b)) to dot(b,a).
+  if (operand->opcode() == HloOpcode::kDot && operand->user_count() == 1 &&
+      operand->shape().rank() == 2) {
+    TF_ASSIGN_OR_RETURN(bool did_transform, [&]() -> StatusOr<bool> {
+      const auto& dnums = operand->dot_dimension_numbers();
+      if (dnums.lhs_batch_dimensions_size() != 0) {
+        return false;
+      }
+      HloInstruction* lhs = operand->mutable_operand(0);
+      if (lhs->shape().rank() != 1 + dnums.lhs_contracting_dimensions_size()) {
+        return false;
+      }
+      HloInstruction* rhs = operand->mutable_operand(1);
+      if (rhs->shape().rank() != 1 + dnums.rhs_contracting_dimensions_size()) {
+        return false;
+      }
+      DotDimensionNumbers new_dnums;
+      *new_dnums.mutable_lhs_contracting_dimensions() =
+          dnums.rhs_contracting_dimensions();
+      *new_dnums.mutable_rhs_contracting_dimensions() =
+          dnums.lhs_contracting_dimensions();
+      TF_RETURN_IF_ERROR(ReplaceWithNewInstruction(
+          transpose, HloInstruction::CreateDot(transpose->shape(), /*lhs=*/rhs,
+                                               /*rhs=*/lhs, new_dnums,
+                                               operand->precision_config())));
+      return true;
+    }());
+    if (did_transform) {
+      return Status::OK();
+    }
   }
 
   // Replace transpose with a reshape if more than one degenerate method is
@@ -3472,7 +3995,7 @@ StatusOr<bool> AlgebraicSimplifierVisitor::SimplifyConvToDot(
     std::vector<int64> dims(operand->shape().dimensions_size());
     std::iota(dims.begin(), dims.end(), 0);
     return computation_->AddInstruction(
-        HloInstruction::CreateUnary(shape, HloOpcode::kBitcast, operand));
+        HloInstruction::CreateBitcast(shape, operand));
   };
 
   // Replace it with a dot, with bitcasts around it to get the right shape.
@@ -3611,8 +4134,9 @@ StatusOr<bool> AlgebraicSimplifier::Run(HloModule* module) {
   XLA_VLOG_LINES(2,
                  "AlgebraicSimplifier::Run(), before:\n" + module->ToString());
   bool changed = false;
+  AlgebraicSimplifierVisitor visitor(options_, this);
   for (auto* comp : module->MakeNonfusionComputations()) {
-    if (AlgebraicSimplifierVisitor::Run(comp, options_, this)) {
+    if (visitor.Run(comp, options_, this)) {
       changed = true;
     }
   }

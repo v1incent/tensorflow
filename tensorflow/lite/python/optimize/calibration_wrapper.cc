@@ -61,6 +61,8 @@ inline TensorType TfLiteTypeToSchemaType(TfLiteType type) {
       return TensorType_FLOAT32;  // TODO(b/129336260): No schema type for none.
     case kTfLiteFloat32:
       return TensorType_FLOAT32;
+    case kTfLiteFloat16:
+      return TensorType_FLOAT16;
     case kTfLiteInt32:
       return TensorType_INT32;
     case kTfLiteUInt8:
@@ -186,7 +188,8 @@ PyObject* CalibrationWrapper::SetTensor(int index, PyObject* value) {
 }
 
 PyObject* CalibrationWrapper::QuantizeModel(int input_py_type,
-                                            int output_py_type) {
+                                            int output_py_type,
+                                            bool allow_float) {
   TfLiteType input_type = python_utils::TfLiteTypeFromPyType(input_py_type);
   TfLiteType output_type = python_utils::TfLiteTypeFromPyType(output_py_type);
   if (input_type == kTfLiteNoType || output_type == kTfLiteNoType) {
@@ -195,11 +198,41 @@ PyObject* CalibrationWrapper::QuantizeModel(int input_py_type,
     return nullptr;
   }
   auto tflite_model = CreateMutableModel(*model_->GetModel());
-  reader_->AddCalibrationToModel(tflite_model.get());
+  reader_->AddCalibrationToModel(tflite_model.get(), /*update=*/false);
   flatbuffers::FlatBufferBuilder builder;
   auto status = tflite::optimize::QuantizeModel(
       &builder, tflite_model.get(), TfLiteTypeToSchemaType(input_type),
-      TfLiteTypeToSchemaType(output_type), error_reporter_.get());
+      TfLiteTypeToSchemaType(output_type), allow_float, error_reporter_.get());
+  if (status != kTfLiteOk) {
+    error_reporter_->exception();
+    return nullptr;
+  }
+
+  return python_utils::ConvertToPyString(
+      reinterpret_cast<const char*>(builder.GetCurrentBufferPointer()),
+      builder.GetSize());
+}
+
+PyObject* CalibrationWrapper::QuantizeModel(int input_py_type,
+                                            int output_py_type,
+                                            bool allow_float,
+                                            const char* operator_output_name) {
+  string op_name = std::string(operator_output_name);
+
+  TfLiteType input_type = python_utils::TfLiteTypeFromPyType(input_py_type);
+  TfLiteType output_type = python_utils::TfLiteTypeFromPyType(output_py_type);
+  if (input_type == kTfLiteNoType || output_type == kTfLiteNoType) {
+    PyErr_SetString(PyExc_ValueError,
+                    "Input/output type cannot be kTfLiteNoType");
+    return nullptr;
+  }
+  auto tflite_model = CreateMutableModel(*model_->GetModel());
+  reader_->AddCalibrationToModel(tflite_model.get(), /*update=*/false);
+  flatbuffers::FlatBufferBuilder builder;
+  auto status = tflite::optimize::QuantizeModel(
+      &builder, tflite_model.get(), TfLiteTypeToSchemaType(input_type),
+      TfLiteTypeToSchemaType(output_type), allow_float, {op_name},
+      error_reporter_.get());
   if (status != kTfLiteOk) {
     error_reporter_->exception();
     return nullptr;

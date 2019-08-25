@@ -18,6 +18,12 @@ classmethods to convert a model based on the original model format:
 *   `TFLiteConverter.from_concrete_functions()`: Converts
     [concrete functions](concrete_function.md).
 
+Note: The TensorFlow Lite 2.0 alpha had a different version of the
+`TFLiteConverter` API which only contained the classmethod
+[`from_concrete_function`](https://www.tensorflow.org/versions/r2.0/api_docs/python/tf/lite/TFLiteConverter#from_concrete_function).
+The API detailed in this document can be installed using the
+[`tf-nightly-2.0-preview`](#installing_the_tensorflow_20_nightly_) pip install.
+
 This document contains [example usages](#examples) of the API, a detailed list
 of [changes in the API between 1.X and 2.0](#differences), and
 [instructions](#versioning) on running the different versions of TensorFlow.
@@ -48,6 +54,19 @@ tf.saved_model.save(root, export_dir, to_save)
 # Convert the model.
 converter = tf.lite.TFLiteConverter.from_saved_model(export_dir)
 tflite_model = converter.convert()
+```
+
+This API does not have the option of specifying the input shape of any input
+arrays. If your model requires specifying the input shape, use the
+[`from_concrete_functions`](#concrete_function) classmethod instead. The code
+looks similar to the following:
+
+```python
+model = tf.saved_model.load(export_dir)
+concrete_func = model.signatures[
+  tf.saved_model.DEFAULT_SERVING_SIGNATURE_DEF_KEY]
+concrete_func.inputs[0].set_shape([1, 256, 256, 3])
+converter = TFLiteConverter.from_concrete_functions([concrete_func])
 ```
 
 ### Converting a Keras model <a name="keras"></a>
@@ -134,6 +153,9 @@ input_data = np.array(np.random.random_sample(input_shape), dtype=np.float32)
 interpreter.set_tensor(input_details[0]['index'], input_data)
 
 interpreter.invoke()
+
+# The function `get_tensor()` returns a copy of the tensor data.
+# Use `tensor()` in order to get a pointer to the tensor.
 tflite_results = interpreter.get_tensor(output_details[0]['index'])
 
 # Test the TensorFlow model on random input data.

@@ -24,7 +24,9 @@ from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_string_ops
 from tensorflow.python.ops import string_ops
 from tensorflow.python.ops.ragged import ragged_array_ops
+from tensorflow.python.ops.ragged import ragged_math_ops
 from tensorflow.python.ops.ragged import ragged_tensor
+from tensorflow.python.util import compat as util_compat
 from tensorflow.python.util import deprecation
 from tensorflow.python.util.tf_export import tf_export
 
@@ -36,9 +38,9 @@ def string_bytes_split(input, name=None):  # pylint: disable=redefined-builtin
   Examples:
 
   ```python
-  >>> tf.strings.to_bytes('hello')
+  >>> tf.strings.bytes_split('hello')
   ['h', 'e', 'l', 'l', 'o']
-  >>> tf.strings.to_bytes(['hello', '123'])
+  >>> tf.strings.bytes_split(['hello', '123'])
   <RaggedTensor [['h', 'e', 'l', 'l', 'o'], ['1', '2', '3']]>
   ```
 
@@ -53,7 +55,7 @@ def string_bytes_split(input, name=None):  # pylint: disable=redefined-builtin
     name: A name for the operation (optional).
 
   Returns:
-    A `RaggedTensor` of rank `N+1`: the bytes that make up the soruce strings.
+    A `RaggedTensor` of rank `N+1`: the bytes that make up the source strings.
   """
   with ops.name_scope(name, "StringsByteSplit", [input]):
     input = ragged_tensor.convert_to_tensor_or_ragged_tensor(input,
@@ -463,6 +465,8 @@ def string_split_v2(input, sep=None, maxsplit=-1, name=None):  # pylint: disable
   Example:
 
   ```python
+  >>> tf.strings.split('hello world')
+  <Tensor ['hello', 'world']>
   >>> tf.strings.split(['hello world', 'a b c'])
   <tf.RaggedTensor [['hello', 'world'], ['a', 'b', 'c']]>
   ```
@@ -477,7 +481,8 @@ def string_split_v2(input, sep=None, maxsplit=-1, name=None):  # pylint: disable
   Note that the above mentioned behavior matches python's str.split.
 
   Args:
-    input: `1-D` string `Tensor`, the strings to split.
+    input: A string `Tensor` of rank `N`, the strings to split.  If
+      `rank(input)` is not known statically, then it is assumed to be `1`.
     sep: `0-D` string `Tensor`, the delimiter string.
     maxsplit: An `int`. If `maxsplit > 0`, limit of the split of the result.
     name: A name for the operation (optional).
@@ -486,16 +491,30 @@ def string_split_v2(input, sep=None, maxsplit=-1, name=None):  # pylint: disable
     ValueError: If sep is not a string.
 
   Returns:
-    A `RaggedTensor` of rank `2`: the strings split according to the delimiter.
+    A `RaggedTensor` of rank `N+1`, the strings split according to the
+    delimiter.
   """
   with ops.name_scope(name, "StringSplit", [input]):
-    sparse_result = string_ops.string_split_v2(input, sep=sep,
-                                               maxsplit=maxsplit)
-    return ragged_tensor.RaggedTensor.from_value_rowids(
-        values=sparse_result.values,
-        value_rowids=sparse_result.indices[:, 0],
-        nrows=sparse_result.dense_shape[0],
-        validate=False)
+    input = ragged_tensor.convert_to_tensor_or_ragged_tensor(
+        input, dtype=dtypes.string, name="input")
+    if isinstance(input, ragged_tensor.RaggedTensor):
+      return input.with_flat_values(
+          string_split_v2(input.flat_values, sep, maxsplit))
+
+    rank = input.shape.ndims
+    if rank == 0:
+      return string_split_v2(array_ops.stack([input]), sep, maxsplit)[0]
+    elif rank == 1 or rank is None:
+      sparse_result = string_ops.string_split_v2(
+          input, sep=sep, maxsplit=maxsplit)
+      return ragged_tensor.RaggedTensor.from_value_rowids(
+          values=sparse_result.values,
+          value_rowids=sparse_result.indices[:, 0],
+          nrows=sparse_result.dense_shape[0],
+          validate=False)
+    else:
+      return string_split_v2(
+          ragged_tensor.RaggedTensor.from_tensor(input), sep, maxsplit)
 
 
 @tf_export(v1=["string_split"])
@@ -594,7 +613,8 @@ def strings_split_v1(input=None, sep=None, maxsplit=-1,  # pylint: disable=redef
   Note that the above mentioned behavior matches python's str.split.
 
   Args:
-    input: `1-D` string `Tensor`, the strings to split.
+    input: A string `Tensor` of rank `N`, the strings to split.  If
+      `rank(input)` is not known statically, then it is assumed to be `1`.
     sep: `0-D` string `Tensor`, the delimiter character.
     maxsplit: An `int`. If `maxsplit > 0`, limit of the split of the result.
     result_type: The tensor type for the result: one of `"RaggedTensor"` or
@@ -606,22 +626,175 @@ def strings_split_v1(input=None, sep=None, maxsplit=-1,  # pylint: disable=redef
     ValueError: If sep is not a string.
 
   Returns:
-    A `SparseTensor` of rank `2`, the strings split according to the delimiter.
-    The first column of the indices corresponds to the row in `source` and the
-    second column corresponds to the index of the split component in this row.
+    A `SparseTensor` or `RaggedTensor` of rank `N+1`, the strings split
+    according to the delimiter.
   """
-  source = deprecation.deprecated_argument_lookup(
+  input = deprecation.deprecated_argument_lookup(
       "input", input, "source", source)
-  with ops.name_scope(name, "StringSplit", [source]):
-    sparse_result = string_ops.string_split_v2(
-        source, sep=sep, maxsplit=maxsplit)
+  with ops.name_scope(name, "StringSplit", [input]):
+    input = ragged_tensor.convert_to_tensor_or_ragged_tensor(
+        input, dtype=dtypes.string, name="input")
+    if result_type == "SparseTensor" and input.shape.rank == 1:
+      return string_ops.string_split_v2(input, sep=sep, maxsplit=maxsplit)
+
+    ragged_result = string_split_v2(input, sep=sep, maxsplit=maxsplit)
     if result_type == "SparseTensor":
-      return sparse_result
+      return ragged_result.to_sparse()
     elif result_type == "RaggedTensor":
-      return ragged_tensor.RaggedTensor.from_value_rowids(
-          values=sparse_result.values,
-          value_rowids=sparse_result.indices[:, 0],
-          nrows=sparse_result.dense_shape[0],
-          validate=False)
+      return ragged_result
     else:
       raise ValueError("result_type must be 'RaggedTensor' or 'SparseTensor'.")
+
+
+def reduce_join(inputs, axis=None, keepdims=None, separator="", name=None):
+  """For docs, see: _RAGGED_REDUCE_DOCSTRING."""
+  return ragged_math_ops.ragged_reduce_aggregate(
+      string_ops.reduce_join, string_ops.unsorted_segment_join, inputs, axis,
+      keepdims, separator, name or "RaggedSegmentJoin")
+
+
+@tf_export("strings.ngrams")
+def ngrams(data,
+           ngram_width,
+           separator=" ",
+           pad_values=None,
+           padding_width=None,
+           preserve_short_sequences=False,
+           name=None):
+  """Create a tensor of n-grams based on `data`.
+
+  Creates a tensor of n-grams based on `data`. The n-grams are created by
+  joining windows of `width` adjacent strings from the inner axis of `data`
+  using `separator`.
+
+  The input data can be padded on both the start and end of the sequence, if
+  desired, using the `pad_values` argument. If set, `pad_values` should contain
+  either a tuple of strings or a single string; the 0th element of the tuple
+  will be used to pad the left side of the sequence and the 1st element of the
+  tuple will be used to pad the right side of the sequence. The `padding_width`
+  arg controls how many padding values are added to each side; it defaults to
+  `ngram_width-1`.
+
+  If this op is configured to not have padding, or if it is configured to add
+  padding with `padding_width` set to less than ngram_width-1, it is possible
+  that a sequence, or a sequence plus padding, is smaller than the ngram
+  width. In that case, no ngrams will be generated for that sequence. This can
+  be prevented by setting `preserve_short_sequences`, which will cause the op
+  to always generate at least one ngram per non-empty sequence.
+
+  Args:
+    data: A Tensor or RaggedTensor containing the source data for the ngrams.
+    ngram_width: The width(s) of the ngrams to create. If this is a list or
+      tuple, the op will return ngrams of all specified arities in list order.
+      Values must be non-Tensor integers greater than 0.
+    separator: The separator string used between ngram elements. Must be a
+      string constant, not a Tensor.
+    pad_values: A tuple of (left_pad_value, right_pad_value), a single string,
+      or None. If None, no padding will be added; if a single string, then that
+      string will be used for both left and right padding. Values must be Python
+      strings.
+    padding_width: If set, `padding_width` pad values will be added to both
+      sides of each sequence. Defaults to `ngram_width`-1. Must be greater than
+      0. (Note that 1-grams are never padded, regardless of this value.)
+    preserve_short_sequences: If true, then ensure that at least one ngram is
+      generated for each input sequence.  In particular, if an input sequence is
+      shorter than `min(ngram_width) + 2*pad_width`, then generate a single
+      ngram containing the entire sequence.  If false, then no ngrams are
+      generated for these short input sequences.
+    name: The op name.
+
+  Returns:
+    A RaggedTensor of ngrams. If `data.shape=[D1...DN, S]`, then
+    `output.shape=[D1...DN, NUM_NGRAMS]`, where
+    `NUM_NGRAMS=S-ngram_width+1+2*padding_width`.
+
+  Raises:
+    TypeError: if `pad_values` is set to an invalid type.
+    ValueError: if `pad_values`, `padding_width`, or `ngram_width` is set to an
+      invalid value.
+  """
+
+  with ops.name_scope(name, "StringNGrams", [data]):
+    if pad_values is None:
+      left_pad = ""
+      right_pad = ""
+    elif isinstance(pad_values, (list, tuple)):
+      if (not isinstance(pad_values[0], util_compat.bytes_or_text_types) or
+          not isinstance(pad_values[1], util_compat.bytes_or_text_types)):
+        raise TypeError(
+            "pad_values must be a string, tuple of strings, or None.")
+      left_pad = pad_values[0]
+      right_pad = pad_values[1]
+    else:
+      if not isinstance(pad_values, util_compat.bytes_or_text_types):
+        raise TypeError(
+            "pad_values must be a string, tuple of strings, or None.")
+      left_pad = pad_values
+      right_pad = pad_values
+
+    if padding_width is not None and padding_width < 1:
+      raise ValueError("padding_width must be greater than 0.")
+
+    if padding_width is not None and pad_values is None:
+      raise ValueError("pad_values must be provided if padding_width is set.")
+
+    data = ragged_tensor.convert_to_tensor_or_ragged_tensor(
+        data, name="data", dtype=dtypes.string)
+
+    # preserve the shape of the data if it is a tensor
+    to_tensor = False
+    if isinstance(data, ops.Tensor):
+      dense_shape = array_ops.concat([array_ops.shape(data)[:-1], [-1]], axis=0)
+      to_tensor = True
+
+    if not isinstance(data, ragged_tensor.RaggedTensor):
+      if data.shape.ndims is None:
+        raise ValueError("Rank of data must be known.")
+      elif data.shape.ndims == 0:
+        raise ValueError("Data must have rank>0")
+      elif data.shape.ndims == 1:
+        rt = ragged_tensor.RaggedTensor.from_row_starts(
+            data, [0], validate=False)
+        return ngrams(rt, ngram_width, separator, pad_values, padding_width,
+                      preserve_short_sequences, name)[0]
+      else:
+        data = ragged_tensor.RaggedTensor.from_tensor(
+            data, ragged_rank=data.shape.ndims - 1)
+
+    if data.ragged_rank > 1:
+      output = data.with_values(
+          ngrams(data.values, ngram_width, separator, pad_values, padding_width,
+                 preserve_short_sequences, name))
+      return array_ops.reshape(output.flat_values,
+                               dense_shape) if to_tensor else output
+
+    if pad_values is None:
+      padding_width = 0
+
+    if pad_values is not None and padding_width is None:
+      padding_width = -1
+
+    if not isinstance(ngram_width, (list, tuple)):
+      ngram_widths = [ngram_width]
+    else:
+      ngram_widths = ngram_width
+    for width in ngram_widths:
+      if width < 1:
+        raise ValueError("All ngram_widths must be greater than 0. Got %s" %
+                         ngram_width)
+
+    output, output_splits = gen_string_ops.string_n_grams(
+        data=data.flat_values,
+        data_splits=data.row_splits,
+        separator=separator,
+        ngram_widths=ngram_widths,
+        left_pad=left_pad,
+        right_pad=right_pad,
+        pad_width=padding_width,
+        preserve_short_sequences=preserve_short_sequences)
+
+    # if the input is Dense tensor, the output should also be a dense tensor
+    output = ragged_tensor.RaggedTensor.from_row_splits(
+        values=output, row_splits=output_splits, validate=False)
+    return array_ops.reshape(output.flat_values,
+                             dense_shape) if to_tensor else output

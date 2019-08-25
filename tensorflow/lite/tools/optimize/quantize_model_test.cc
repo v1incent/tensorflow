@@ -98,6 +98,31 @@ TEST_F(QuantizeConvModelTest, QuantizationSucceeds) {
   ASSERT_TRUE(output_model);
 }
 
+TEST_F(QuantizeConvModelTest, SkipUnspecifiedLayer) {
+  auto status =
+      QuantizeModel(&builder_, &model_, TensorType_FLOAT32, TensorType_FLOAT32,
+                    /*allow_float=*/true, {}, &error_reporter_);
+  EXPECT_EQ(status, kTfLiteOk);
+  ASSERT_EQ(model_.subgraphs.size(), readonly_model_->subgraphs()->size());
+  // The resulting model should be the same.
+  ASSERT_EQ(model_.subgraphs.size(), readonly_model_->subgraphs()->size());
+  for (size_t subgraph_idx = 0; subgraph_idx < model_.subgraphs.size();
+       subgraph_idx++) {
+    const auto quantized_graph = model_.subgraphs[subgraph_idx].get();
+    const auto float_graph = readonly_model_->subgraphs()->Get(subgraph_idx);
+    ASSERT_EQ(quantized_graph->tensors.size(), float_graph->tensors()->size());
+    for (size_t i = 0; i < quantized_graph->tensors.size(); i++) {
+      const auto quant_tensor = quantized_graph->tensors[i].get();
+      const auto float_tensor = float_graph->tensors()->Get(i);
+      EXPECT_EQ(quant_tensor->buffer, float_tensor->buffer());
+      EXPECT_EQ(quant_tensor->is_variable, float_tensor->is_variable());
+      EXPECT_EQ(quant_tensor->shape, GetAsVector(float_tensor->shape()));
+      EXPECT_EQ(quant_tensor->name, float_tensor->name()->str());
+      EXPECT_EQ(quant_tensor->type, float_tensor->type());
+    }
+  }
+}
+
 TEST_F(QuantizeConvModelTest, TensorShapesAndStructureIsUnchanged) {
   auto status = QuantizeModel(&builder_, &model_, TensorType_INT8,
                               TensorType_INT8, &error_reporter_);
@@ -120,7 +145,7 @@ TEST_F(QuantizeConvModelTest, TensorShapesAndStructureIsUnchanged) {
   // check op and versioning.
   EXPECT_EQ(model_.operator_codes.size(), 1);
   EXPECT_EQ(model_.operator_codes[0]->builtin_code, BuiltinOperator_CONV_2D);
-  EXPECT_EQ(model_.operator_codes[0]->version, 2);
+  EXPECT_EQ(model_.operator_codes[0]->version, 3);
 }
 
 TEST_F(QuantizeConvModelTest, OperatorsAreUnchanged) {
@@ -133,7 +158,11 @@ TEST_F(QuantizeConvModelTest, OperatorsAreUnchanged) {
     const auto float_model_op = readonly_model_->operator_codes()->Get(i);
     EXPECT_EQ(model_.operator_codes[i]->builtin_code,
               float_model_op->builtin_code());
-    EXPECT_EQ(model_.operator_codes[i]->version, 2);
+    if (model_.operator_codes[i]->builtin_code == BuiltinOperator_CONV_2D) {
+      EXPECT_EQ(model_.operator_codes[i]->version, 3);
+    } else {
+      EXPECT_EQ(model_.operator_codes[i]->version, 2);
+    }
   }
 
   ASSERT_EQ(model_.subgraphs.size(), readonly_model_->subgraphs()->size());
@@ -370,7 +399,7 @@ TEST_F(QuantizeConcatModelTest, AddRequantBeforeConcat) {
             BuiltinOperator_CONCATENATION);
   EXPECT_EQ(model_.operator_codes[0]->version, 2);
   EXPECT_EQ(model_.operator_codes[1]->builtin_code, BuiltinOperator_QUANTIZE);
-  EXPECT_EQ(model_.operator_codes[1]->version, 1);
+  EXPECT_EQ(model_.operator_codes[1]->version, 2);
 }
 
 class QuantizeConvModel1Test : public QuantizeModelTest {
@@ -471,7 +500,7 @@ TEST_F(QuantizeConvModel1Test, VerifyConvQuantizationWithUnitScale) {
   // check op and versioning.
   EXPECT_EQ(model_.operator_codes.size(), 1);
   EXPECT_EQ(model_.operator_codes[0]->builtin_code, BuiltinOperator_CONV_2D);
-  EXPECT_EQ(model_.operator_codes[0]->version, 2);
+  EXPECT_EQ(model_.operator_codes[0]->version, 3);
 }
 
 class QuantizeConvModel2Test : public QuantizeModelTest {
@@ -569,7 +598,7 @@ TEST_F(QuantizeConvModel2Test, VerifyConvQuantization) {
   // check op and versioning.
   EXPECT_EQ(model_.operator_codes.size(), 1);
   EXPECT_EQ(model_.operator_codes[0]->builtin_code, BuiltinOperator_CONV_2D);
-  EXPECT_EQ(model_.operator_codes[0]->version, 2);
+  EXPECT_EQ(model_.operator_codes[0]->version, 3);
 }
 
 class QuantizeSoftmaxTest : public QuantizeModelTest {
@@ -932,6 +961,42 @@ TEST_F(QuantizeFCTest, VerifyFC) {
   EXPECT_EQ(model_.operator_codes[0]->version, 4);
   EXPECT_EQ(model_.operator_codes[1]->builtin_code, BuiltinOperator_RESHAPE);
   EXPECT_EQ(model_.operator_codes[1]->version, 1);
+}
+
+class QuantizeCustomOpTest : public QuantizeModelTest {
+ protected:
+  QuantizeCustomOpTest() {
+    input_model_ = ReadModel(internal::kModelMixed);
+    readonly_model_ = input_model_->GetModel();
+    readonly_model_->UnPackTo(&model_);
+  }
+};
+
+TEST_F(QuantizeCustomOpTest, VerifyMixedQuantization) {
+  auto status =
+      QuantizeModel(&builder_, &model_, TensorType_INT8, TensorType_INT8,
+                    /*allow_float=*/true, &error_reporter_);
+  ASSERT_EQ(kTfLiteOk, status);
+  const auto& subgraph = model_.subgraphs[0];
+  auto float_graph = readonly_model_->subgraphs()->Get(0);
+  // The original model reshape->custom->custom->squeeze.
+  ASSERT_EQ(float_graph->operators()->size(), 4);
+  // The resulting model should be:
+  // reshape->dequantize->custom->custom->quantize->squeeze.
+  ASSERT_EQ(subgraph->operators.size(), 6);
+  const std::vector<BuiltinOperator> op_codes = {
+      BuiltinOperator_RESHAPE,  BuiltinOperator_DEQUANTIZE,
+      BuiltinOperator_CUSTOM,   BuiltinOperator_CUSTOM,
+      BuiltinOperator_QUANTIZE, BuiltinOperator_SQUEEZE};
+  const std::vector<TensorType> op_input_types = {
+      TensorType_INT8,    TensorType_INT8,    TensorType_FLOAT32,
+      TensorType_FLOAT32, TensorType_FLOAT32, TensorType_INT8};
+  for (int i = 0; i < subgraph->operators.size(); ++i) {
+    OperatorT* op = subgraph->operators[i].get();
+    ASSERT_EQ(model_.operator_codes[op->opcode_index]->builtin_code,
+              op_codes[i]);
+    ASSERT_EQ(subgraph->tensors[op->inputs[0]]->type, op_input_types[i]);
+  }
 }
 
 }  // namespace

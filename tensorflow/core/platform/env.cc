@@ -468,7 +468,9 @@ class FileStream : public ::tensorflow::protobuf::io::ZeroCopyInputStream {
     pos_ += count;
     return true;
   }
-  protobuf_int64 ByteCount() const override { return pos_; }
+  int64_t ByteCount() const override {
+    return pos_;
+  }
   Status status() const { return status_; }
 
   bool Next(const void** data, int* size) override {
@@ -553,6 +555,21 @@ Status ReadTextProto(Env* env, const string& fname,
 #else
   return errors::Unimplemented("Can't parse text protos with protolite.");
 #endif
+}
+
+Status ReadTextOrBinaryProto(Env* env, const string& fname,
+#if !defined(TENSORFLOW_LITE_PROTOS)
+                             ::tensorflow::protobuf::Message* proto
+#else
+                             ::tensorflow::protobuf::MessageLite* proto
+#endif
+) {
+#if !defined(TENSORFLOW_LITE_PROTOS)
+  if (ReadTextProto(env, fname, proto).ok()) {
+    return Status::OK();
+  }
+#endif
+  return ReadBinaryProto(env, fname, proto);
 }
 
 }  // namespace tensorflow

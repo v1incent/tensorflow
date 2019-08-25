@@ -24,6 +24,7 @@ import collections
 import numpy as np
 
 from tensorflow.python.eager import context
+from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.keras import activations
 from tensorflow.python.keras import backend as K
@@ -35,9 +36,11 @@ from tensorflow.python.keras.engine.input_spec import InputSpec
 from tensorflow.python.keras.utils import generic_utils
 from tensorflow.python.keras.utils import tf_utils
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import control_flow_util
 from tensorflow.python.ops import state_ops
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.training.tracking import base as trackable
+from tensorflow.python.training.tracking import data_structures
 from tensorflow.python.util import nest
 from tensorflow.python.util.tf_export import keras_export
 
@@ -143,7 +146,8 @@ class StackedRNNCells(Layer):
       input_shape = input_shape[0]
     for cell in self.cells:
       if isinstance(cell, Layer):
-        cell.build(input_shape)
+        if not cell.built:
+          cell.build(input_shape)
       if getattr(cell, 'output_size', None) is not None:
         output_dim = cell.output_size
       elif _is_multiple_state(cell.state_size):
@@ -405,7 +409,7 @@ class RNN(Layer):
     self.state_spec = None
     self._states = None
     self.constants_spec = None
-    self._num_constants = None
+    self._num_constants = 0
 
   @property
   def states(self):
@@ -536,7 +540,8 @@ class RNN(Layer):
 
     # allow cell (if layer) to build before we set or validate state_spec
     if isinstance(self.cell, Layer):
-      self.cell.build(step_input_shape)
+      if not self.cell.built:
+        self.cell.build(step_input_shape)
 
     # set or validate state_spec
     if _is_multiple_state(self.cell.state_size):
@@ -729,6 +734,15 @@ class RNN(Layer):
           new_states = [new_states]
         return output, new_states
 
+    # `input_length` is passed as the `maximum_iterations` arg to tf.while_loop.
+    # We only specify that when building for XLA since that causes slowdowns
+    # on GPU in TF.
+    if (not context.executing_eagerly() and
+        control_flow_util.GraphOrParentsInXlaContext(ops.get_default_graph())):
+      input_length = timesteps
+    else:
+      input_length = None
+
     last_output, outputs, states = K.rnn(
         step,
         inputs,
@@ -737,14 +751,14 @@ class RNN(Layer):
         go_backwards=self.go_backwards,
         mask=mask,
         unroll=self.unroll,
-        input_length=timesteps,
+        input_length=input_length,
         time_major=self.time_major,
         zero_output_for_mask=self.zero_output_for_mask)
     if self.stateful:
       updates = []
-      for i in range(len(states)):
-        updates.append(state_ops.assign(self.states[i], states[i]))
-      self.add_update(updates, inputs)
+      for state_, state in zip(nest.flatten(self.states), nest.flatten(states)):
+        updates.append(state_ops.assign(state_, state))
+      self.add_update(updates)
 
     if self.return_sequences:
       output = outputs
@@ -768,7 +782,7 @@ class RNN(Layer):
         and not isinstance(inputs, tuple)):
       # get initial_state from full input spec
       # as they could be copied to multiple GPU.
-      if self._num_constants is None:
+      if not self._num_constants:
         initial_state = inputs[1:]
       else:
         initial_state = inputs[1:-self._num_constants]
@@ -812,48 +826,36 @@ class RNN(Layer):
                        'the batch size by passing a '
                        '`batch_shape` argument to your Input layer.')
     # initialize state if None
-    if self.states[0] is None:
-      if _is_multiple_state(self.cell.state_size):
-        self.states = [
-            K.zeros([batch_size] + tensor_shape.as_shape(dim).as_list())
-            for dim in self.cell.state_size
-        ]
-      else:
-        self.states = [
-            K.zeros([batch_size] +
-                    tensor_shape.as_shape(self.cell.state_size).as_list())
-        ]
+    if nest.flatten(self.states)[0] is None:
+      def create_state_variable(state):
+        return K.zeros([batch_size] + tensor_shape.as_shape(state).as_list())
+      self.states = nest.map_structure(
+          create_state_variable, self.cell.state_size)
+      if not nest.is_sequence(self.states):
+        self.states = [self.states]
     elif states is None:
-      if _is_multiple_state(self.cell.state_size):
-        for state, dim in zip(self.states, self.cell.state_size):
-          K.set_value(state,
-                      np.zeros([batch_size] +
-                               tensor_shape.as_shape(dim).as_list()))
-      else:
-        K.set_value(self.states[0], np.zeros(
-            [batch_size] +
-            tensor_shape.as_shape(self.cell.state_size).as_list()))
+      for state, size in zip(nest.flatten(self.states),
+                             nest.flatten(self.cell.state_size)):
+        K.set_value(state, np.zeros([batch_size] +
+                                    tensor_shape.as_shape(size).as_list()))
     else:
-      if not isinstance(states, (list, tuple)):
-        states = [states]
-      if len(states) != len(self.states):
+      flat_states = nest.flatten(self.states)
+      flat_input_states = nest.flatten(states)
+      if len(flat_input_states) != len(flat_states):
         raise ValueError('Layer ' + self.name + ' expects ' +
-                         str(len(self.states)) + ' states, '
-                         'but it received ' + str(len(states)) +
+                         str(len(flat_states)) + ' states, '
+                         'but it received ' + str(len(flat_input_states)) +
                          ' state values. Input received: ' + str(states))
-      for index, (value, state) in enumerate(zip(states, self.states)):
-        if _is_multiple_state(self.cell.state_size):
-          dim = self.cell.state_size[index]
-        else:
-          dim = self.cell.state_size
-        if value.shape != tuple([batch_size] +
-                                tensor_shape.as_shape(dim).as_list()):
+      set_value_tuples = []
+      for i, (value, state) in enumerate(zip(flat_input_states,
+                                             flat_states)):
+        if value.shape != state.shape:
           raise ValueError(
-              'State ' + str(index) + ' is incompatible with layer ' +
+              'State ' + str(i) + ' is incompatible with layer ' +
               self.name + ': expected shape=' + str(
-                  (batch_size, dim)) + ', found shape=' + str(value.shape))
-        # TODO(fchollet): consider batch calls to `set_value`.
-        K.set_value(state, value)
+                  (batch_size, state)) + ', found shape=' + str(value.shape))
+        set_value_tuples.append((state, value))
+      K.batch_set_value(set_value_tuples)
 
   def get_config(self):
     config = {
@@ -864,7 +866,7 @@ class RNN(Layer):
         'unroll': self.unroll,
         'time_major': self.time_major
     }
-    if self._num_constants is not None:
+    if self._num_constants:
       config['num_constants'] = self._num_constants
     if self.zero_output_for_mask:
       config['zero_output_for_mask'] = self.zero_output_for_mask
@@ -881,7 +883,7 @@ class RNN(Layer):
   def from_config(cls, config, custom_objects=None):
     from tensorflow.python.keras.layers import deserialize as deserialize_layer  # pylint: disable=g-import-not-at-top
     cell = deserialize_layer(config.pop('cell'), custom_objects=custom_objects)
-    num_constants = config.pop('num_constants', None)
+    num_constants = config.pop('num_constants', 0)
     layer = cls(cell, **config)
     layer._num_constants = num_constants
     return layer
@@ -1221,7 +1223,7 @@ class SimpleRNNCell(DropoutRNNCellMixin, Layer):
       h = K.bias_add(h, self.bias)
 
     if rec_dp_mask is not None:
-      prev_output *= rec_dp_mask
+      prev_output = prev_output * rec_dp_mask
     output = h + K.dot(prev_output, self.recurrent_kernel)
     if self.activation is not None:
       output = self.activation(output)
@@ -1371,7 +1373,8 @@ class SimpleRNN(RNN):
         recurrent_constraint=recurrent_constraint,
         bias_constraint=bias_constraint,
         dropout=dropout,
-        recurrent_dropout=recurrent_dropout)
+        recurrent_dropout=recurrent_dropout,
+        dtype=kwargs.get('dtype'))
     super(SimpleRNN, self).__init__(
         cell,
         return_sequences=return_sequences,
@@ -1687,7 +1690,7 @@ class GRUCell(DropoutRNNCellMixin, Layer):
       hh = self.activation(x_h + recurrent_h)
     else:
       if 0. < self.dropout < 1.:
-        inputs *= dp_mask[0]
+        inputs = inputs * dp_mask[0]
 
       # inputs projected by all gate matrices at once
       matrix_x = K.dot(inputs, self.kernel)
@@ -1700,7 +1703,7 @@ class GRUCell(DropoutRNNCellMixin, Layer):
       x_h = matrix_x[:, 2 * self.units:]
 
       if 0. < self.recurrent_dropout < 1.:
-        h_tm1 *= rec_dp_mask[0]
+        h_tm1 = h_tm1 * rec_dp_mask[0]
 
       if self.reset_after:
         # hidden state projected by all gate matrices at once
@@ -1899,7 +1902,8 @@ class GRU(RNN):
         dropout=dropout,
         recurrent_dropout=recurrent_dropout,
         implementation=implementation,
-        reset_after=reset_after)
+        reset_after=reset_after,
+        dtype=kwargs.get('dtype'))
     super(GRU, self).__init__(
         cell,
         return_sequences=return_sequences,
@@ -2134,7 +2138,13 @@ class LSTMCell(DropoutRNNCellMixin, Layer):
     self.dropout = min(1., max(0., dropout))
     self.recurrent_dropout = min(1., max(0., recurrent_dropout))
     self.implementation = implementation
-    self.state_size = [self.units, self.units]
+    # tuple(_ListWrapper) was silently dropping list content in at least 2.7.10,
+    # and fixed after 2.7.16. Converting the state_size to wrapper around
+    # NoDependency(), so that the base_layer.__setattr__ will not convert it to
+    # ListWrapper. Down the stream, self.states will be a list since it is
+    # generated from nest.map_structure with list, and tuple(list) will work
+    # properly.
+    self.state_size = data_structures.NoDependency([self.units, self.units])
     self.output_size = self.units
 
   @tf_utils.shape_type_conversion
@@ -2245,10 +2255,10 @@ class LSTMCell(DropoutRNNCellMixin, Layer):
       c, o = self._compute_carry_and_output(x, h_tm1, c_tm1)
     else:
       if 0. < self.dropout < 1.:
-        inputs *= dp_mask[0]
+        inputs = inputs * dp_mask[0]
       z = K.dot(inputs, self.kernel)
       if 0. < self.recurrent_dropout < 1.:
-        h_tm1 *= rec_dp_mask[0]
+        h_tm1 = h_tm1 * rec_dp_mask[0]
       z += K.dot(h_tm1, self.recurrent_kernel)
       if self.use_bias:
         z = K.bias_add(z, self.bias)
@@ -2519,7 +2529,8 @@ class LSTM(RNN):
         bias_constraint=bias_constraint,
         dropout=dropout,
         recurrent_dropout=recurrent_dropout,
-        implementation=implementation)
+        implementation=implementation,
+        dtype=kwargs.get('dtype'))
     super(LSTM, self).__init__(
         cell,
         return_sequences=return_sequences,
@@ -2703,7 +2714,7 @@ def _standardize_args(inputs, initial_state, constants, num_constants):
     # could be a list of items, or list of list if the initial_state is complex
     # structure, and finally followed by constants which is a flat list.
     assert initial_state is None and constants is None
-    if num_constants is not None:
+    if num_constants:
       constants = inputs[-num_constants:]
       inputs = inputs[:-num_constants]
     if len(inputs) > 1:

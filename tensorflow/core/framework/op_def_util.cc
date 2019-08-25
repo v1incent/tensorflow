@@ -18,9 +18,10 @@ limitations under the License.
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+
 #include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/attr_value_util.h"
-#include "tensorflow/core/framework/op_def.pb_text.h"
+#include "tensorflow/core/framework/op_def.pb.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/stringpiece.h"
@@ -183,12 +184,12 @@ const ApiDef::Arg* FindInputArg(StringPiece name, const ApiDef& api_def) {
   return nullptr;
 }
 
-#define VALIDATE(EXPR, ...)                                            \
-  do {                                                                 \
-    if (!(EXPR)) {                                                     \
-      return errors::InvalidArgument(                                  \
-          __VA_ARGS__, "; in OpDef: ", ProtoShortDebugString(op_def)); \
-    }                                                                  \
+#define VALIDATE(EXPR, ...)                                        \
+  do {                                                             \
+    if (!(EXPR)) {                                                 \
+      return errors::InvalidArgument(                              \
+          __VA_ARGS__, "; in OpDef: ", op_def.ShortDebugString()); \
+    }                                                              \
   } while (false)
 
 static Status ValidateArg(const OpDef::ArgDef& arg, const OpDef& op_def,
@@ -251,10 +252,10 @@ static Status ValidateArg(const OpDef::ArgDef& arg, const OpDef& op_def,
 Status ValidateOpDef(const OpDef& op_def) {
   using ::tensorflow::strings::Scanner;
 
-  if (!str_util::StartsWith(op_def.name(), "_")) {
+  if (!absl::StartsWith(op_def.name(), "_")) {
     VALIDATE(Scanner(op_def.name())
                  .One(Scanner::UPPERLETTER)
-                 .Any(Scanner::LETTER_DIGIT)
+                 .Any(Scanner::LETTER_DIGIT_UNDERSCORE)
                  .Eos()
                  .GetResult(),
              "Invalid name: ", op_def.name(), " (Did you use CamelCase?)");
@@ -271,11 +272,11 @@ Status ValidateOpDef(const OpDef& op_def) {
 
     // Validate type
     StringPiece type(attr.type());
-    bool is_list = str_util::ConsumePrefix(&type, "list(");
+    bool is_list = absl::ConsumePrefix(&type, "list(");
     bool found = false;
     for (StringPiece valid : {"string", "int", "float", "bool", "type", "shape",
                               "tensor", "func"}) {
-      if (str_util::ConsumePrefix(&type, valid)) {
+      if (absl::ConsumePrefix(&type, valid)) {
         found = true;
         break;
       }
@@ -283,7 +284,7 @@ Status ValidateOpDef(const OpDef& op_def) {
     VALIDATE(found, "Unrecognized type '", type, "' in attr '", attr.name(),
              "'");
     if (is_list) {
-      VALIDATE(str_util::ConsumePrefix(&type, ")"),
+      VALIDATE(absl::ConsumePrefix(&type, ")"),
                "'list(' is missing ')' in attr ", attr.name(), "'s type ",
                attr.type());
     }

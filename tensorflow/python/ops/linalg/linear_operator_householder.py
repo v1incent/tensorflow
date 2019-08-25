@@ -124,7 +124,7 @@ class LinearOperatorHouseholder(linear_operator.LinearOperator):
     """
 
     with ops.name_scope(name, values=[reflection_axis]):
-      self._reflection_axis = ops.convert_to_tensor(
+      self._reflection_axis = linear_operator_util.convert_nonref_to_tensor(
           reflection_axis, name="reflection_axis")
       self._check_reflection_axis(self._reflection_axis)
 
@@ -155,15 +155,15 @@ class LinearOperatorHouseholder(linear_operator.LinearOperator):
 
   def _check_reflection_axis(self, reflection_axis):
     """Static check of reflection_axis."""
-    if (reflection_axis.get_shape().ndims is not None and
-        reflection_axis.get_shape().ndims < 1):
+    if (reflection_axis.shape.ndims is not None and
+        reflection_axis.shape.ndims < 1):
       raise ValueError(
           "Argument reflection_axis must have at least 1 dimension.  "
           "Found: %s" % reflection_axis)
 
   def _shape(self):
     # If d_shape = [5, 3], we return [5, 3, 3].
-    d_shape = self._reflection_axis.get_shape()
+    d_shape = self._reflection_axis.shape
     return d_shape.concatenate(d_shape[-1:])
 
   def _shape_tensor(self):
@@ -195,12 +195,12 @@ class LinearOperatorHouseholder(linear_operator.LinearOperator):
 
     # Note that because this is a reflection, it lies in O(n) (for real vector
     # spaces) or U(n) (for complex vector spaces), and thus is its own adjoint.
+    reflection_axis = ops.convert_to_tensor(self.reflection_axis)
     x = linalg.adjoint(x) if adjoint_arg else x
-    normalized_axis = self.reflection_axis / linalg.norm(
-        self.reflection_axis, axis=-1, keepdims=True)
+    normalized_axis = reflection_axis / linalg.norm(
+        reflection_axis, axis=-1, keepdims=True)
     mat = normalized_axis[..., array_ops.newaxis]
-    x_dot_normalized_v = linear_operator_util.matmul_with_broadcast(
-        mat, x, adjoint_a=True)
+    x_dot_normalized_v = math_ops.matmul(mat, x, adjoint_a=True)
 
     return x - 2 * mat * x_dot_normalized_v
 
@@ -227,8 +227,7 @@ class LinearOperatorHouseholder(linear_operator.LinearOperator):
     normalized_axis = self.reflection_axis / linalg.norm(
         self.reflection_axis, axis=-1, keepdims=True)
     mat = normalized_axis[..., array_ops.newaxis]
-    matrix = -2 * linear_operator_util.matmul_with_broadcast(
-        mat, mat, adjoint_b=True)
+    matrix = -2 * math_ops.matmul(mat, mat, adjoint_b=True)
     return array_ops.matrix_set_diag(
         matrix, 1. + array_ops.matrix_diag_part(matrix))
 

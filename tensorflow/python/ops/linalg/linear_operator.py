@@ -24,9 +24,11 @@ import contextlib
 import numpy as np
 import six
 
+from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import tensor_util
+from tensorflow.python.module import module
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import check_ops
 from tensorflow.python.ops import linalg_ops
@@ -35,6 +37,7 @@ from tensorflow.python.ops.linalg import linalg_impl as linalg
 from tensorflow.python.ops.linalg import linear_operator_algebra
 from tensorflow.python.ops.linalg import linear_operator_util
 from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.util import dispatch
 from tensorflow.python.util.tf_export import tf_export
 
 __all__ = ["LinearOperator"]
@@ -43,7 +46,7 @@ __all__ = ["LinearOperator"]
 # TODO(langmore) Use matrix_solve_ls for singular or non-square matrices.
 @tf_export("linalg.LinearOperator")
 @six.add_metaclass(abc.ABCMeta)
-class LinearOperator(object):
+class LinearOperator(module.Module):
   """Base class defining a [batch of] linear operator[s].
 
   Subclasses of `LinearOperator` provide access to common methods on a
@@ -197,9 +200,10 @@ class LinearOperator(object):
 
     graph_parents = [] if graph_parents is None else graph_parents
     for i, t in enumerate(graph_parents):
-      if t is None or not tensor_util.is_tensor(t):
+      if t is None or not (linear_operator_util.is_ref(t) or
+                           tensor_util.is_tensor(t)):
         raise ValueError("Graph parent item %d is not a Tensor; %s." % (i, t))
-    self._dtype = dtype
+    self._dtype = dtypes.as_dtype(dtype).base_dtype if dtype else dtype
     self._graph_parents = graph_parents
     self._is_non_singular = is_non_singular
     self._is_self_adjoint = is_self_adjoint
@@ -207,12 +211,13 @@ class LinearOperator(object):
     self._name = name or type(self).__name__
 
   @contextlib.contextmanager
-  def _name_scope(self, name=None, values=None):
+  def _name_scope(self, name=None):
     """Helper function to standardize op scope."""
-    with ops.name_scope(self.name):
-      with ops.name_scope(
-          name, values=((values or []) + self._graph_parents)) as scope:
-        yield scope
+    full_name = self.name
+    if name is not None:
+      full_name += "/" + name
+    with ops.name_scope(full_name) as scope:
+      yield scope
 
   @property
   def dtype(self):
@@ -266,7 +271,7 @@ class LinearOperator(object):
 
     If this operator acts like the batch matrix `A` with
     `A.shape = [B1,...,Bb, M, N]`, then this returns
-    `TensorShape([B1,...,Bb, M, N])`, equivalent to `A.get_shape()`.
+    `TensorShape([B1,...,Bb, M, N])`, equivalent to `A.shape`.
 
     Returns:
       `TensorShape`, statically determined, may be undefined.
@@ -303,7 +308,7 @@ class LinearOperator(object):
 
     If this operator acts like the batch matrix `A` with
     `A.shape = [B1,...,Bb, M, N]`, then this returns
-    `TensorShape([B1,...,Bb])`, equivalent to `A.get_shape()[:-2]`
+    `TensorShape([B1,...,Bb])`, equivalent to `A.shape[:-2]`
 
     Returns:
       `TensorShape`, statically determined, may be undefined.
@@ -558,7 +563,7 @@ class LinearOperator(object):
 
   def _check_input_dtype(self, arg):
     """Check that arg.dtype == self.dtype."""
-    if arg.dtype != self.dtype:
+    if arg.dtype.base_dtype != self.dtype:
       raise TypeError(
           "Expected argument to have dtype %s.  Found: %s in tensor %s" %
           (self.dtype, arg.dtype, arg))
@@ -610,7 +615,7 @@ class LinearOperator(object):
       with self._name_scope(name):
         return linear_operator_algebra.matmul(left_operator, right_operator)
 
-    with self._name_scope(name, values=[x]):
+    with self._name_scope(name):
       x = ops.convert_to_tensor(x, name="x")
       self._check_input_dtype(x)
 
@@ -618,7 +623,7 @@ class LinearOperator(object):
       arg_dim = -1 if adjoint_arg else -2
       tensor_shape.dimension_at_index(
           self.shape, self_dim).assert_is_compatible_with(
-              x.get_shape()[arg_dim])
+              x.shape[arg_dim])
 
       return self._matmul(x, adjoint=adjoint, adjoint_arg=adjoint_arg)
 
@@ -654,12 +659,12 @@ class LinearOperator(object):
     Returns:
       A `Tensor` with shape `[..., M]` and same `dtype` as `self`.
     """
-    with self._name_scope(name, values=[x]):
+    with self._name_scope(name):
       x = ops.convert_to_tensor(x, name="x")
       self._check_input_dtype(x)
       self_dim = -2 if adjoint else -1
       tensor_shape.dimension_at_index(
-          self.shape, self_dim).assert_is_compatible_with(x.get_shape()[-1])
+          self.shape, self_dim).assert_is_compatible_with(x.shape[-1])
       return self._matvec(x, adjoint=adjoint)
 
   def _determinant(self):
@@ -796,7 +801,7 @@ class LinearOperator(object):
       with self._name_scope(name):
         return linear_operator_algebra.solve(left_operator, right_operator)
 
-    with self._name_scope(name, values=[rhs]):
+    with self._name_scope(name):
       rhs = ops.convert_to_tensor(rhs, name="rhs")
       self._check_input_dtype(rhs)
 
@@ -804,7 +809,7 @@ class LinearOperator(object):
       arg_dim = -1 if adjoint_arg else -2
       tensor_shape.dimension_at_index(
           self.shape, self_dim).assert_is_compatible_with(
-              rhs.get_shape()[arg_dim])
+              rhs.shape[arg_dim])
 
       return self._solve(rhs, adjoint=adjoint, adjoint_arg=adjoint_arg)
 
@@ -853,13 +858,12 @@ class LinearOperator(object):
     Raises:
       NotImplementedError:  If `self.is_non_singular` or `is_square` is False.
     """
-    with self._name_scope(name, values=[rhs]):
+    with self._name_scope(name):
       rhs = ops.convert_to_tensor(rhs, name="rhs")
       self._check_input_dtype(rhs)
       self_dim = -1 if adjoint else -2
       tensor_shape.dimension_at_index(
-          self.shape, self_dim).assert_is_compatible_with(
-              rhs.get_shape()[-1])
+          self.shape, self_dim).assert_is_compatible_with(rhs.shape[-1])
 
       return self._solvevec(rhs, adjoint=adjoint)
 
@@ -935,8 +939,6 @@ class LinearOperator(object):
 
   def _to_dense(self):
     """Generic and often inefficient implementation.  Override often."""
-    logging.warn("Using (possibly slow) default implementation of to_dense."
-                 "  Converts by self.matmul(identity).")
     if self.batch_shape.is_fully_defined():
       batch_shape = self.batch_shape
     else:
@@ -1019,10 +1021,96 @@ class LinearOperator(object):
     Returns:
       A `Tensor` with broadcast shape and same `dtype` as `self`.
     """
-    with self._name_scope(name, values=[x]):
+    with self._name_scope(name):
       x = ops.convert_to_tensor(x, name="x")
       self._check_input_dtype(x)
       return self._add_to_tensor(x)
 
   def _can_use_cholesky(self):
     return self.is_self_adjoint and self.is_positive_definite
+
+
+# Overrides for tf.linalg functions. This allows a LinearOperator to be used in
+# place of a Tensor.
+# For instance tf.trace(linop) and linop.trace() both work.
+
+
+@dispatch.dispatch_for_types(linalg.adjoint, LinearOperator)
+def _adjoint(matrix, name=None):
+  return matrix.adjoint(name)
+
+
+@dispatch.dispatch_for_types(linalg.cholesky, LinearOperator)
+def _cholesky(input, name=None):   # pylint:disable=redefined-builtin
+  return input.cholesky(name)
+
+
+# The signature has to match with the one in python/op/array_ops.py,
+# so we have k and padding_value even though we don't use them here.
+@dispatch.dispatch_for_types(linalg.diag_part, LinearOperator)
+def _diag_part(input, name="diag_part", k=0, padding_value=0):  # pylint:disable=redefined-builtin, unused-argument
+  return input.diag_part(name)
+
+
+@dispatch.dispatch_for_types(linalg.det, LinearOperator)
+def _det(input, name=None):  # pylint:disable=redefined-builtin
+  return input.determinant(name)
+
+
+@dispatch.dispatch_for_types(linalg.inv, LinearOperator)
+def _inverse(input, adjoint=False, name=None):   # pylint:disable=redefined-builtin
+  inv = input.inverse(name)
+  if adjoint:
+    inv = inv.adjoint()
+  return inv
+
+
+@dispatch.dispatch_for_types(linalg.logdet, LinearOperator)
+def _logdet(matrix, name=None):
+  if matrix.is_positive_definite and matrix.is_self_adjoint:
+    return matrix.log_abs_determinant(name)
+  raise ValueError("Expected matrix to be self-adjoint positive definite.")
+
+
+@dispatch.dispatch_for_types(math_ops.matmul, LinearOperator)
+def _matmul(  # pylint:disable=missing-docstring
+    a,
+    b,
+    transpose_a=False,
+    transpose_b=False,
+    adjoint_a=False,
+    adjoint_b=False,
+    a_is_sparse=False,
+    b_is_sparse=False,
+    name=None):
+  if transpose_a or transpose_b:
+    raise ValueError("Transposing not supported at this time.")
+  if a_is_sparse or b_is_sparse:
+    raise ValueError("Sparse methods not supported at this time.")
+  if not isinstance(a, LinearOperator):
+    # We use the identity (B^HA^H)^H =  AB
+    adjoint_matmul = b.matmul(
+        a,
+        adjoint=(not adjoint_b),
+        adjoint_arg=(not adjoint_a),
+        name=name)
+    return linalg.adjoint(adjoint_matmul)
+  return a.matmul(
+      b, adjoint=adjoint_a, adjoint_arg=adjoint_b, name=name)
+
+
+@dispatch.dispatch_for_types(linalg.solve, LinearOperator)
+def _solve(
+    matrix,
+    rhs,
+    adjoint=False,
+    name=None):
+  if not isinstance(matrix, LinearOperator):
+    raise ValueError("Passing in `matrix` as a Tensor and `rhs` as a "
+                     "LinearOperator is not supported.")
+  return matrix.solve(rhs, adjoint=adjoint, name=name)
+
+
+@dispatch.dispatch_for_types(linalg.trace, LinearOperator)
+def _trace(x, name=None):
+  return x.trace(name)

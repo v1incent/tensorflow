@@ -28,7 +28,6 @@ from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gradient_checker_v2
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import variables
-from tensorflow.python.ops.linalg import linear_operator_util
 from tensorflow.python.platform import benchmark
 from tensorflow.python.platform import test
 
@@ -264,22 +263,13 @@ class BatchMatMulBenchmark(test.Benchmark):
               name="batch_matmul_manual_broadcast_cpu_{}_{}".format(
                   a_shape, b_shape))
 
-          # Use linear_operator_util.matmul_with_broadcast.
-          name_template = (
-              "batch_matmul_manual_broadcast_with_linear_operator_util"
-              "_cpu_{}_{}"
-          )
-          self.run_op_benchmark(
-              sess,
-              linear_operator_util.matmul_with_broadcast(matrix_a, matrix_b),
-              min_iters=50,
-              name=name_template.format(a_shape, b_shape))
-
 
 if __name__ == "__main__":
-  for dtype_ in [
-      np.float16, np.float32, np.float64, np.complex64, np.complex128, np.int32
-  ]:
+  dtypes_to_test = [np.float16, np.float32, np.float64, np.int32]
+  if not test.is_built_with_rocm():
+    # ROCm does not support BLAS operations for complex types
+    dtypes_to_test += [np.complex64, np.complex128]
+  for dtype_ in dtypes_to_test:
     for adjoint_a_ in False, True:
       for adjoint_b_ in False, True:
         name = "%s_%s_%s" % (dtype_.__name__, adjoint_a_, adjoint_b_)

@@ -1,8 +1,10 @@
-licenses(["notice"])  # Apache 2.0
+load("//tensorflow:tensorflow.bzl", "py_test")
+
+package(
+    licenses = ["notice"],  # Apache 2.0
+)
 
 exports_files(["LICENSE"])
-
-load("//tensorflow:tensorflow.bzl", "py_test")
 
 filegroup(
     name = "all_files",
@@ -32,7 +34,6 @@ py_library(
 py_test(
     name = "special_functions_test",
     srcs = ["special_functions_test.py"],
-    python_version = "PY2",
     srcs_version = "PY2AND3",
     deps = [
         ":lang",

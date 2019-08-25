@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef TENSORFLOW_LITE_EXPERIMENTAL_RUY_CONTEXT_H_
 #define TENSORFLOW_LITE_EXPERIMENTAL_RUY_CONTEXT_H_
 
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -60,9 +61,23 @@ struct Context final {
   }
 
   void EnsureNPerThreadStates(int thread_count) {
-    while (per_thread_states.size() < thread_count) {
+    while (per_thread_states.size() < static_cast<std::size_t>(thread_count)) {
       per_thread_states.emplace_back(new PerThreadState);
     }
+  }
+
+  Tuning GetMainThreadTuning() {
+    EnsureNPerThreadStates(1);
+    TuningResolver* tuning_resolver = &per_thread_states[0]->tuning_resolver;
+    tuning_resolver->SetTuning(explicit_tuning);
+    return tuning_resolver->Resolve();
+  }
+
+  template <Path CompiledPaths>
+  Path GetPathToTake() {
+    last_taken_path =
+        GetMostSignificantPath(CompiledPaths & GetRuntimeEnabledPaths());
+    return last_taken_path;
   }
 
   void SetRuntimeEnabledPaths(Path paths);

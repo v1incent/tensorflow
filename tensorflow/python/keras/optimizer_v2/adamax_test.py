@@ -360,7 +360,7 @@ class AdamaxOptimizerTest(test.TestCase):
       opt = adamax.Adamax(1.)
       opt.minimize(lambda: v1 + v2, var_list=[v1, v2])
       # There should be iteration, and two unique slot variables for v1 and v2.
-      self.assertEqual(5, len(set(opt.variables())))
+      self.assertEqual(5, len({id(v) for v in opt.variables()}))
 
   def testConstructAdamaxWithLR(self):
     opt = adamax.Adamax(lr=1.0)
@@ -374,15 +374,6 @@ class AdamaxOptimizerTest(test.TestCase):
     self.assertAllClose(self.evaluate(opt.lr), (1.0))
     self.assertAllClose(self.evaluate(opt_2.lr), (1.0))
     self.assertAllClose(self.evaluate(opt_3.lr), (0.1))
-
-  def testConstructAdamaxWithEpsilonValues(self):
-    opt = adamax.Adamax(epsilon=None)
-    config = opt.get_config()
-    self.assertEqual(config["epsilon"], 1e-7)
-
-    opt = adamax.Adamax(epsilon=1e-8)
-    config = opt.get_config()
-    self.assertEqual(config["epsilon"], 1e-8)
 
 
 if __name__ == "__main__":
